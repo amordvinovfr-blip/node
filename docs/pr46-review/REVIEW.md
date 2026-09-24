@@ -7,8 +7,11 @@ excluded). The notes below come from replaying synthetic Xray access logs
 through the PR's own code and comparing the result with an operator's
 experience of running a similar detector on the same input.
 
-Everything here is synthetic. No production logs were used. How the blocker
-works is summarized in [HOW-IT-WORKS.md](HOW-IT-WORKS.md).
+Most of this review uses synthetic data. One section,
+[Real traffic](#real-traffic-one-day-four-entry-nodes), is an aggregate-only
+replay of one day of production logs, run by the operator on their own
+infrastructure. How the blocker works is summarized in
+[HOW-IT-WORKS.md](HOW-IT-WORKS.md).
 
 ## Summary
 
@@ -26,6 +29,12 @@ works is summarized in [HOW-IT-WORKS.md](HOW-IT-WORKS.md).
   defaults. TCP BitTorrent still reaches `alert`. Exempting the ports the
   operator exempts (possible with the existing `excludedPorts` field) removes
   that alert and the chain-node block.
+- **On one day of real traffic from four entry nodes, the defaults were
+  quiet but nearly blind.** There was one false block (a BitTorrent user on
+  :6881) in four node-days. A real SSH sweep that the operator's detector
+  flagged reached only `suspicious` (score 50). Only about 4.5% of log lines
+  were scored at all, because about 70% of TCP sessions target a domain rather
+  than an IP.
 - The PR does not build yet: no published `@remnawave/node-plugins` release
   contains the `abuseBlocker` schema.
 
@@ -190,6 +199,71 @@ mail, and 1080/3128/5060/8080/8443
 - True positives: unchanged. The misses need different rules, not different
   ports.
 
+## Real traffic: one day, four entry nodes
+
+The operator replayed one full UTC day of September 2026 from four entry
+(bridge) nodes through the same harness at commit `ed65fff`. Each node sits
+with a different hosting provider, and users connect to them directly.
+
+- **Isolation.** The code ran only in `node:24` containers. Dependencies were
+  installed with no log data mounted. The replay itself ran with
+  `--network none`, as a non-root user, with code and logs mounted read-only.
+- **Data handling.** Only the aggregate `report.json` files left the host.
+  The extracted logs and the per-decision JSONL (user IDs, client IPs) were
+  deleted after the run.
+- **Settings.** Two passes per node: schema defaults, and defaults plus the
+  144-port exemption list (`configs/excluded-ports-context.json`).
+- **Self-test.** The harness self-test passed on the host: 34 of 34.
+
+### Input
+
+| Node | Log lines | TCP | TCP with a domain destination | Excluded 80/443 | Scored by PR | Active users | Client IPs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A | 11.0 M | 10.45 M | 7.42 M (71%) | 2.57 M | 467 k (4.2%) | 3,535 | 22,319 |
+| B | 8.1 M | 7.64 M | 5.25 M (69%) | 2.01 M | 376 k (4.6%) | 3,711 | 22,990 |
+| C | 4.7 M | 4.44 M | 3.16 M (71%) | 1.06 M | 213 k (4.5%) | 3,079 | 17,277 |
+| D | 12.8 M | 11.73 M | 8.11 M (69%) | 3.03 M | 598 k (4.7%) | 3,507 | 22,144 |
+| Total | 36.6 M | 34.26 M | 23.94 M (70%) | 8.67 M | 1.66 M (4.5%) | 13,832 user-days | |
+
+Of the events that were scored, 39-53% were game/realtime ports and 27-36%
+were DNS over TCP. Only 2.2-3.0% were recon ports.
+
+### Decisions
+
+| Node | Defaults | With exemptions | Operator's detector, same day |
+|---|---|---|---|
+| A | none | none | 4 × `session_rate_burst` (1 user) |
+| B | 4 × `suspicious`, 1 × `alert`, **1 block**: `destination_sweep` on :6881 (BitTorrent), 1 user on the IP, 622 sessions dropped for 600 s | none | nothing scan-related |
+| C | none | none | nothing scan-related |
+| D | 2 × `suspicious` (score 50), `destination_sweep` on :22 | same | 1 × `horizontal_sweep_hard` on :22, 21 min |
+
+`blacklist_hit` records from the operator's detector are left out of the
+last column, because PR #46 has no blocklist rule.
+
+What this shows:
+
+- **False blocks are rare with the defaults:** 1 in 4 node-days, about 0.01
+  blocks per hour per 1,000 active users. The one block was BitTorrent,
+  exactly the class the synthetic run predicted. The port exemption list
+  removes it.
+- **The one real scan of the day was not blocked.** Node D carried an SSH
+  sweep that the operator's detector confirmed. PR #46 reported it once as
+  `suspicious` (score 50) 14 minutes after it started and never scored it
+  again. That matches the latching behaviour described in the sensitivity
+  section.
+- **The `session_rate_burst` cases on node A produced no report.** This
+  matches the synthetic miss.
+- **CGNAT and chained nodes did not come up.** Every source IP with a
+  decision had one user. Exit nodes were not replayed.
+- **Coverage is the main limit.** About 70% of TCP sessions on entry nodes
+  have a domain destination, and the harness does not score them (see
+  "Access log vs webhook" below). Scanners mostly target IPs, so this matters
+  less for recon than the number suggests. It still means the blocker sees a
+  small slice of the traffic.
+
+One day on four nodes is a small sample. It says little about how often
+shared addresses would be blocked across a whole fleet or over a month.
+
 ## Suggestions
 
 These are minimal and ordered by how much risk they remove.
@@ -250,11 +324,13 @@ These are minimal and ordered by how much risk they remove.
 
 ## Not verified
 
-- **Real traffic.** All fixtures are synthetic, and the benign traffic model
+- **Real traffic, beyond one day.** Apart from the one-day replay above, all
+  fixtures are synthetic. The benign traffic model
   (`tools/pr46-replay/fixtures/benign-user.js`) uses assumed pool sizes and
   rates. The chained-node blocks depend on the roughly 1% of people who run
   BitTorrent over TCP. With nobody doing so, there was no block in 30 minutes;
-  60 minutes and 4,000 people were also checked ad hoc.
+  60 minutes and 4,000 people were also checked ad hoc. No exit node and no
+  CGNAT case was observed in real data.
 - **Access log vs webhook.** The access log has no
   `originalTarget`/`routeTarget` and no sniffed protocol. Lines with a domain
   destination are therefore not scored, rules that already had a webhook are
