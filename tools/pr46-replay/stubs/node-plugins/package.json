@@ -1,0 +1,18 @@
+{
+  "name": "@remnawave/node-plugins",
+  "version": "0.7.0-pr46.stub",
+  "description": "Review stub: @remnawave/node-plugins 0.7.0 plus the abuseBlocker schema PR #46 depends on. Not for release.",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "main": "build/backend/index.js",
+  "types": "build/backend/index.d.ts",
+  "files": [
+    "build/**/*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}
