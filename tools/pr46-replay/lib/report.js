@@ -71,6 +71,7 @@ class ReportBuilder {
 
         this.decisionsBySeverity = {};
         this.decisionsByAction = {};
+        this.maxScore = null;
         this.blocks = [];
         this.activeBlockByIp = new Map();
         this.droppedUsers = new Set();
@@ -159,6 +160,7 @@ class ReportBuilder {
     observeDecision(decision, timestampMs) {
         increment(this.decisionsBySeverity, decision.severity);
         increment(this.decisionsByAction, decision.action);
+        this.maxScore = Math.max(this.maxScore ?? 0, decision.score);
         if (decision.action !== 'block') return;
 
         const lastHourCutoff = timestampMs - HOUR_MS;
@@ -246,6 +248,7 @@ class ReportBuilder {
                 total: Object.values(this.decisionsBySeverity).reduce((sum, value) => sum + value, 0),
                 bySeverity: this.decisionsBySeverity,
                 byAction: this.decisionsByAction,
+                maxScore: this.maxScore,
             },
             blocks: {
                 total: initialBlocks.length,
