@@ -55,6 +55,7 @@ class ReportBuilder {
             filteredNotTcp: 0,
             filteredNoNumericEmail: 0,
             filteredNoIpDestination: 0,
+            ignoredByList: 0,
             excludedPort: 0,
             analyzed: 0,
             droppedWhileSourceBlocked: 0,
@@ -130,12 +131,16 @@ class ReportBuilder {
     }
 
     /** Why the PR's toAbuseBlockerObservation dropped (or kept) the event. */
-    observeScoringInput(record, observation, excludedPorts) {
+    observeScoringInput(record, observation, excludedPorts, isIgnored) {
         if (!observation) {
             if (record.network !== 'tcp') this.scoring.filteredNotTcp += 1;
             else if (!record.email || !/^\d+$/.test(record.email))
                 this.scoring.filteredNoNumericEmail += 1;
             else this.scoring.filteredNoIpDestination += 1;
+            return;
+        }
+        if (isIgnored(observation)) {
+            this.scoring.ignoredByList += 1;
             return;
         }
         if (excludedPorts.includes(observation.destinationPort)) {

@@ -270,7 +270,7 @@ These are minimal and ordered by how much risk they remove.
 
 ```sh
 git checkout review/pr46-replay && npm ci        # Node 24
-node --test 'tools/pr46-replay/test/*.test.js'   # 33 tests, ~10 s
+node --test 'tools/pr46-replay/test/*.test.js'   # 34 tests, ~10 s
 node tools/pr46-replay/run-scenarios.js          # the Results table
 node tools/pr46-replay/sensitivity.js            # the sensitivity table
 node tools/pr46-replay/run.js --log access.log --out report.json   # any real log, offline

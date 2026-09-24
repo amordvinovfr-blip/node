@@ -61,7 +61,7 @@ Throughput is roughly 70,000 lines per second on one core.
 | `usersPerBlockedSourceIp` | distinct userIds on each blocked IP (last hour before the block, and whole log) |
 | `collateral` | sessions and users dropped while an IP was blocked (closed loop) |
 | `timeToFirstBlock` | from the start of the log, and from the blocked user's first line |
-| `scoringInput` | why lines never reached scoring (UDP, no numeric email, domain target, excluded port) |
+| `scoringInput` | why lines never reached scoring (UDP, no numeric email, domain target, ignore lists, excluded port) |
 
 ## Synthetic scenarios and tests
 

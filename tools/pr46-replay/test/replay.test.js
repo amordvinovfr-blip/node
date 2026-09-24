@@ -116,6 +116,20 @@ describe('replay harness', () => {
         assert.equal(attempts, 0);
     });
 
+    it('applies --config overrides through the PR schema, including ignore lists', async () => {
+        const ignored = await replayLines(scanLines(), {
+            abuseBlocker: { ignoreLists: { sourceIp: ['192.0.2.0/24'] } },
+        });
+        assert.equal(ignored.decisions.total, 0);
+        assert.equal(ignored.scoringInput.ignoredByList, 50);
+        assert.equal(ignored.scoringInput.analyzed, 0);
+
+        const stricter = await replayLines(scanLines(), { abuseBlocker: { blockScore: 300 } });
+        assert.equal(stricter.policy.blockScore, 300);
+        assert.equal(stricter.blocks.total, 0);
+        assert.equal(stricter.decisions.bySeverity.alert, 2);
+    });
+
     it('report contains aggregates only, no IPs or user IDs', async () => {
         const report = await replayLines(scanLines({ email: 987654 }));
         const text = JSON.stringify(report);

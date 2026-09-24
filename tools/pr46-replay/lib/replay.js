@@ -89,6 +89,16 @@ class ReplayEngine {
             throw new Error(`Shared lists are not resolved by the harness; inline them: ${shared}`);
         }
 
+        // Mirrors the ignore checks at the top of AbuseBlockerState.analyze(),
+        // only to label the report; the PR code still makes the decision.
+        const ignoredUsers = new Set(lists.userId.map(String));
+        const ignoredSources = new this.pr.IpMatcher(lists.sourceIp);
+        const ignoredDestinations = new this.pr.IpMatcher(lists.destinationIp);
+        this.isIgnored = (observation) =>
+            ignoredUsers.has(observation.userId) ||
+            ignoredSources.matches(observation.sourceIp) ||
+            ignoredDestinations.matches(observation.destinationIp);
+
         this.pluginState = new this.pr.PluginStateService();
         this.pluginState.abuseBlocker.configure({
             config: this.config,
@@ -139,6 +149,7 @@ class ReplayEngine {
             record,
             this.pr.toAbuseBlockerObservation(webhook),
             this.config.excludedPorts,
+            this.isIgnored,
         );
 
         this.clock.set(record.timestampMs);

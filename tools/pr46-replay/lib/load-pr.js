@@ -114,7 +114,7 @@ const loadPr = () => {
     const { XrayWebhookEvent } = src('src/modules/_plugin/events/xray-webhook/xray-webhook.event.ts');
     const { PluginStateService } = src('src/modules/_plugin/services/plugin-state.service.ts');
     const { AbuseBlockerState } = src('src/modules/_plugin/services/states/abuse-blocker.state.ts');
-    const { parseNetworkEndpoint } = src('src/modules/_plugin/utils/ip-address.utils.ts');
+    const { IpMatcher, parseNetworkEndpoint } = src('src/modules/_plugin/utils/ip-address.utils.ts');
     const { NodePluginSchema } = requireFromRepo('@remnawave/node-plugins');
 
     loaded = {
@@ -125,6 +125,7 @@ const loadPr = () => {
         XrayWebhookEvent,
         PluginStateService,
         AbuseBlockerState,
+        IpMatcher,
         parseNetworkEndpoint,
         NodePluginSchema,
     };
