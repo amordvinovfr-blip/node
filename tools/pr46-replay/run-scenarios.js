@@ -5,13 +5,15 @@
 // review table (markdown). Per-scenario aggregate reports go to
 // tools/pr46-replay/out/scenarios.json.
 //
-//   node tools/pr46-replay/run-scenarios.js [--write-logs]
+//   node tools/pr46-replay/run-scenarios.js [--write-logs] [--config <abuse.json>]
 //
 // --write-logs also writes each scenario's access.log to fixtures/out/, so it
-// can be replayed with run.js.
+// can be replayed with run.js. --config merges settings into abuseBlocker
+// (what-if runs); the output file is then out/scenarios.<config name>.json.
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { parseArgs } = require('node:util');
 
 const { replayLines } = require('./lib/replay');
 const { SCENARIOS } = require('./scenarios');
@@ -45,7 +47,7 @@ const describeActual = (report) => {
     }
     if (input.analyzed === 0) {
         if (input.filteredNotTcp > 0 && input.excludedPort === 0) return 'no block; never scored (UDP is ignored)';
-        if (input.excludedPort > 0) return 'no block; never scored (80/443 excluded, UDP ignored)';
+        if (input.excludedPort > 0) return 'no block; never scored (excluded ports, UDP ignored)';
     }
     return 'no block; no report';
 };
@@ -65,7 +67,18 @@ const verdict = (scenario, report) => {
 };
 
 const main = async () => {
-    const writeLogs = process.argv.includes('--write-logs');
+    const { values } = parseArgs({
+        options: {
+            'write-logs': { type: 'boolean', default: false },
+            config: { type: 'string' },
+        },
+    });
+    const writeLogs = values['write-logs'];
+    const abuseBlocker = values.config ? JSON.parse(fs.readFileSync(values.config, 'utf8')) : {};
+    const outFile = path.join(
+        OUT_DIR,
+        values.config ? `scenarios.${path.basename(values.config, '.json')}.json` : 'scenarios.json',
+    );
     fs.mkdirSync(OUT_DIR, { recursive: true });
     if (writeLogs) fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -73,7 +86,7 @@ const main = async () => {
     for (const scenario of SCENARIOS) {
         const { lines, meta } = scenario.generate();
         if (writeLogs) fs.writeFileSync(path.join(LOG_DIR, `${scenario.id}.log`), `${lines.join('\n')}\n`);
-        const report = await replayLines(lines, { scenario: scenario.id });
+        const report = await replayLines(lines, { scenario: scenario.id, abuseBlocker });
         results.push({ scenario, meta, report });
     }
 
@@ -88,9 +101,10 @@ const main = async () => {
         meta,
         report,
     }));
-    fs.writeFileSync(path.join(OUT_DIR, 'scenarios.json'), `${JSON.stringify(summary, null, 2)}\n`);
+    fs.writeFileSync(outFile, `${JSON.stringify(summary, null, 2)}\n`);
 
-    console.log('| Scenario | Expected (CONTEXT.md) | Actual (PR #46 defaults) | Verdict |');
+    const actualLabel = values.config ? `PR #46 + ${path.basename(values.config)}` : 'PR #46 defaults';
+    console.log(`| Scenario | Expected (CONTEXT.md) | Actual (${actualLabel}) | Verdict |`);
     console.log('|---|---|---|---|');
     for (const row of summary) {
         console.log(`| ${row.title} | ${row.expected} | ${row.actual} | ${row.verdict} |`);
@@ -106,7 +120,7 @@ const main = async () => {
                 `${report.timeToFirstBlock.secondsFromLogStart ?? '-'} |`,
         );
     }
-    console.log(`\nwrote ${path.relative(process.cwd(), path.join(OUT_DIR, 'scenarios.json'))}`);
+    console.log(`\nwrote ${path.relative(process.cwd(), outFile)}`);
 };
 
 main().catch((error) => {
