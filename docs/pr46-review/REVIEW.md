@@ -113,7 +113,7 @@ on one port in a short window" fired mostly on ordinary users, so the operator
 demoted them to observe-only. The noisy classes were BitTorrent/DHT, DNS,
 NTP, games and realtime apps, mail clients, proxies to the user's own server,
 and heavy browsing. Blocking by source IP was judged unsafe behind CGNAT and
-on chained nodes.
+on chained nodes. The full operator notes are in [CONTEXT.md](CONTEXT.md).
 
 ## Results
 
