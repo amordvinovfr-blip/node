@@ -167,6 +167,24 @@ const addToRing = (ring: IRingCounterState, now: number, slotMs: number): number
     return ring.total;
 };
 
+const oldestKeys = new WeakMap<Map<unknown, unknown>, Iterator<unknown>>();
+
+/**
+ * Deletes the oldest key of an insertion-ordered map. A long-lived iterator is
+ * kept because `keys().next()` walks over every deleted slot at the front of the
+ * table, which makes LRU eviction O(n) under churn.
+ */
+const deleteOldest = <K>(map: Map<K, unknown>): void => {
+    let iterator = oldestKeys.get(map) as Iterator<K> | undefined;
+    let next = iterator?.next();
+    if (!iterator || !next || next.done) {
+        iterator = map.keys();
+        oldestKeys.set(map, iterator);
+        next = iterator.next();
+    }
+    if (!next.done) map.delete(next.value);
+};
+
 /** Map used as an LRU with at most `cap` entries. */
 const getOrCreate = <K, V>(map: Map<K, V>, key: K, cap: number, create: () => V): V => {
     const existing = map.get(key);
@@ -175,7 +193,7 @@ const getOrCreate = <K, V>(map: Map<K, V>, key: K, cap: number, create: () => V)
         map.set(key, existing);
         return existing;
     }
-    if (map.size >= cap) map.delete(map.keys().next().value!);
+    if (map.size >= cap) deleteOldest(map);
     const created = create();
     map.set(key, created);
     return created;
@@ -416,8 +434,7 @@ export class AbuseBlockerState {
     addReport(report: AbuseBlockerReportModel): void {
         const limit = this.config?.reportBufferSize ?? 1;
         if (!this.reports.has(report.eventId) && this.reports.size >= limit) {
-            const oldest = this.reports.keys().next().value as string | undefined;
-            if (oldest) this.reports.delete(oldest);
+            deleteOldest(this.reports);
             this.droppedReports += 1;
         }
         this.reports.set(report.eventId, report);
@@ -494,8 +511,7 @@ export class AbuseBlockerState {
 
         const config = this.config!;
         if (this.users.size >= config.maxTrackedUsers) {
-            const oldest = this.users.keys().next().value as string | undefined;
-            if (oldest) this.users.delete(oldest);
+            deleteOldest(this.users);
             this.evictedUsers += 1;
         }
 
@@ -797,7 +813,7 @@ export class AbuseBlockerState {
         let source = this.sources.get(sourceIp);
         if (!source) {
             if (this.sources.size >= this.config!.sourceGuards.maxTrackedSources) {
-                this.sources.delete(this.sources.keys().next().value!);
+                deleteOldest(this.sources);
             }
             source = { users: new Map(), touchedAt: timestamp };
             this.sources.set(sourceIp, source);
