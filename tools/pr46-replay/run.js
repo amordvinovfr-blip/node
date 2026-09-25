@@ -39,6 +39,7 @@ Replay
   --sub-second            Use sub-second log timestamps instead of Xray's whole-second webhook ts.
   --reorder-window-ms <n> Reorder buffer for slightly out-of-order lines (default 2000).
   --max-sources <n>       Source IPs kept for users-per-IP counts (default 200000).
+  --heap-samples <n>      Every n lines, force a GC and record the heap (report: harness.heapAfterGcMb).
   -h, --help`;
 
 const readJson = (file) => (file ? JSON.parse(fs.readFileSync(file, 'utf8')) : {});
@@ -62,6 +63,7 @@ const main = async () => {
             'sub-second': { type: 'boolean', default: false },
             'reorder-window-ms': { type: 'string', default: '2000' },
             'max-sources': { type: 'string', default: '200000' },
+            'heap-samples': { type: 'string', default: '0' },
             help: { type: 'boolean', short: 'h', default: false },
         },
     });
@@ -102,6 +104,7 @@ const main = async () => {
             subSecond: values['sub-second'],
             reorderWindowMs: Number(values['reorder-window-ms']),
             maxSources: Number(values['max-sources']),
+            heapSampleEvery: Number(values['heap-samples']),
             decisionsPath,
             onDecision: (decision) => decisions.write(`${JSON.stringify(decision)}\n`),
         },

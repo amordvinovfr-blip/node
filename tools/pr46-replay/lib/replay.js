@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 const { isIP } = require('node:net');
 const readline = require('node:readline');
+const v8 = require('node:v8');
+const vm = require('node:vm');
 const zlib = require('node:zlib');
 
 const { installFakeClock } = require('./fake-clock');
@@ -235,8 +237,14 @@ class Replay {
             nodes: 1,
             scenario: null,
             maxSources: 200_000,
+            heapSampleEvery: 0,
             ...options,
         };
+        this.heapSamplesMb = [];
+        if (this.options.heapSampleEvery > 0) {
+            v8.setFlagsFromString('--expose-gc');
+            this.gc = vm.runInNewContext('gc');
+        }
         this.counters = { handlerErrors: 0 };
         this.clock = installFakeClock(0);
         this.finished = false;
@@ -268,6 +276,10 @@ class Replay {
 
     observeLine(line) {
         this.input.lines.total += 1;
+        if (this.gc && this.input.lines.total % this.options.heapSampleEvery === 0) {
+            this.gc();
+            this.heapSamplesMb.push(Math.round(process.memoryUsage().heapUsed / 1e6));
+        }
         const record = parseLine(line);
         if (!record && line.trim().length > 0) this.input.lines.unparsed += 1;
         return record;
@@ -319,7 +331,12 @@ class Replay {
             },
             input: this.input.build(),
             variants,
-            harness: { handlerErrors: this.counters.handlerErrors },
+            harness: {
+                handlerErrors: this.counters.handlerErrors,
+                ...(this.options.heapSampleEvery > 0
+                    ? { heapSampleEvery: this.options.heapSampleEvery, heapAfterGcMb: this.heapSamplesMb }
+                    : {}),
+            },
             decisionsFile: decisionsPath ?? null,
         };
     }

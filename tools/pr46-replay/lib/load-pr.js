@@ -171,7 +171,8 @@ const loadPr = (variant = 'patched') => {
         /** Maps `webhook` and keeps the result for the handler's next call. */
         mapForHandler: (webhook, options) => {
             const observation = mapObservation(webhook, options);
-            handoff = { webhook, observation };
+            // A null observation never reaches the handler, so nothing is handed off.
+            handoff = observation ? { webhook, observation } : null;
             return observation;
         },
         XrayWebhookEvent,

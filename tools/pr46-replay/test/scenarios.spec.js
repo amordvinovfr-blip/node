@@ -172,7 +172,7 @@ describe('PR #46 on true positives (CONTEXT.md §1)', () => {
 });
 
 describe('scenario registry', () => {
-    // compare.test.js pins every registered scenario for both variants; this
+    // compare.spec.js pins every registered scenario for both variants; this
     // file keeps the detailed PR head assertions for the original sixteen.
     it('the scenarios detailed above are registered', () => {
         const covered = [

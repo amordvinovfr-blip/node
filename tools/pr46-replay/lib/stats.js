@@ -96,6 +96,20 @@ class HyperLogLog {
     }
 }
 
+const oldestKeys = new WeakMap();
+
+/** Deletes the oldest key; a kept iterator avoids rescanning deleted slots (O(n) under churn). */
+const deleteOldest = (map) => {
+    let iterator = oldestKeys.get(map);
+    let next = iterator?.next();
+    if (!iterator || next.done) {
+        iterator = map.keys();
+        oldestKeys.set(map, iterator);
+        next = iterator.next();
+    }
+    if (!next.done) map.delete(next.value);
+};
+
 /** LRU of source IP -> (userId -> last seen), for "users on this IP" lookups. */
 class SourceUsers {
     constructor(maxSources) {
@@ -109,7 +123,7 @@ class SourceUsers {
         let source = this.sources.get(sourceIp);
         if (!source) {
             if (this.sources.size >= this.maxSources) {
-                this.sources.delete(this.sources.keys().next().value);
+                deleteOldest(this.sources);
                 this.evicted += 1;
             }
             source = { users: new Map(), touchedAt: timestampMs };
