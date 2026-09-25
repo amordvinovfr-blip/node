@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
-// How PR #46 reacts to one scanning user as a function of target order,
-// number of ports and rate. Each run is a 15-minute scan by one user from one
-// IP, replayed with the schema defaults.
+// How the PR #46 head rules and the patched rules react to one scanning user,
+// as a function of target order, number of ports and rate. Each run is a
+// 15-minute scan by one user from one IP. The patched rules run in block mode
+// (defaults otherwise) so that "blocked" means "would be blocked".
 //
 //   node tools/pr46-replay/sensitivity.js
 
@@ -38,19 +39,27 @@ const scanLines = ({ order, ports, ratePerMinute, seed }) => {
     return toLines(sessions, rng);
 };
 
+const cell = (result) => {
+    const severity =
+        ['blocked', 'alert', 'suspicious'].find((name) => result.decisions.bySeverity[name]) ?? '-';
+    const first = result.timeToFirstBlock.secondsFromLogStart;
+    return `${severity} | ${result.blocks.total > 0 ? `yes (${first} s)` : 'no'}`;
+};
+
 const main = async () => {
-    console.log('| Target order | Ports | Targets/min | Highest severity | Max score | Blocked | First block (s) |');
-    console.log('|---|---|---:|---|---:|---|---:|');
+    console.log('| Target order | Ports | Targets/min | PR head: highest | PR head: blocked | patched: highest | patched: blocked |');
+    console.log('|---|---|---:|---|---|---|---|');
     for (const pattern of PATTERNS) {
         for (const ratePerMinute of RATES) {
             const lines = scanLines({ ...pattern, ratePerMinute, seed: ratePerMinute });
-            const report = await replayLines(lines, { scenario: 'sensitivity' });
-            const severity =
-                ['blocked', 'alert', 'suspicious'].find((name) => report.decisions.bySeverity[name]) ?? '-';
+            const report = await replayLines(lines, {
+                scenario: 'sensitivity',
+                variants: ['head', 'patched'],
+                patchedMode: 'block',
+            });
             console.log(
-                `| ${pattern.order} | ${pattern.ports.join(', ')} | ${ratePerMinute} | ${severity} | ` +
-                    `${report.decisions.maxScore ?? 0} | ${report.blocks.total > 0 ? 'yes' : 'no'} | ` +
-                    `${report.timeToFirstBlock.secondsFromLogStart ?? '-'} |`,
+                `| ${pattern.order} | ${pattern.ports.join(', ')} | ${ratePerMinute} | ` +
+                    `${cell(report.variants.head)} | ${cell(report.variants.patched)} |`,
             );
         }
     }
