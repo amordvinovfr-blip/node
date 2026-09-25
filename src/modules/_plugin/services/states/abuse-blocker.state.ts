@@ -40,6 +40,7 @@ interface IIncidentState {
     candidateAt: number | null;
     lastCandidateAt: number;
     lastFiredAt: number;
+    lastSeenAt: number;
 }
 
 /** Distinct members (networks, domain or hostname hashes) with last-seen time, oldest first. */
@@ -114,6 +115,7 @@ const createIncident = (): IIncidentState => ({
     candidateAt: null,
     lastCandidateAt: Number.NEGATIVE_INFINITY,
     lastFiredAt: Number.NEGATIVE_INFINITY,
+    lastSeenAt: Number.NEGATIVE_INFINITY,
 });
 
 const createMemberSet = (): IMemberSetState => ({ ...createIncident(), members: new Map() });
@@ -140,12 +142,14 @@ const touchMember = (
     }
     state.members.delete(member);
     state.members.set(member, now);
+    state.lastSeenAt = now;
     if (state.members.size > cap) state.members.delete(state.members.keys().next().value!);
     return state.members.size;
 };
 
 /** Counts one session at `now` and returns the total over the ring. */
 const addToRing = (ring: IRingCounterState, now: number, slotMs: number): number => {
+    ring.lastSeenAt = Math.max(ring.lastSeenAt, now);
     const slots = ring.buckets.length;
     const slot = Math.floor(now / slotMs);
     if (slot > ring.head) {
@@ -185,13 +189,29 @@ const deleteOldest = <K>(map: Map<K, unknown>): void => {
     if (!next.done) map.delete(next.value);
 };
 
-/** Map used as an LRU with at most `cap` entries. */
-const getOrCreate = <K, V>(map: Map<K, V>, key: K, cap: number, create: () => V): V => {
+/**
+ * Map used as an LRU with at most `cap` entries. Before a new entry is added,
+ * idle entries at the old end are dropped, so state follows recent activity
+ * instead of filling up to the cap.
+ */
+const getOrCreate = <K, V>(
+    map: Map<K, V>,
+    key: K,
+    cap: number,
+    create: () => V,
+    isIdle?: (value: V) => boolean,
+): V => {
     const existing = map.get(key);
     if (existing !== undefined) {
         map.delete(key);
         map.set(key, existing);
         return existing;
+    }
+    if (isIdle) {
+        for (const [oldKey, value] of map) {
+            if (!isIdle(value)) break;
+            map.delete(oldKey);
+        }
     }
     if (map.size >= cap) deleteOldest(map);
     const created = create();
@@ -621,6 +641,15 @@ export class AbuseBlockerState {
         const config = this.config!;
         const now = observation.timestamp;
         const port = observation.destinationPort;
+        // A key with nothing in its window and no cooldown running carries no
+        // information; recreating it later gives the same result.
+        const cooldownMs = config.incidentCooldownSeconds * 1000;
+        const idleAfter =
+            (windowSeconds: number) =>
+            (state: IIncidentState): boolean =>
+                now - state.lastSeenAt >= windowSeconds * 1000 &&
+                now - state.lastFiredAt >= cooldownMs &&
+                now - state.lastCandidateAt >= cooldownMs;
         const push = (
             rule: AbuseBlockerRuleName,
             key: string,
@@ -668,8 +697,12 @@ export class AbuseBlockerState {
         const countHammer = (targetKey: string, label: string) => {
             if (!hammer.enabled) return;
             const slotMs = (hammer.windowSeconds * 1000) / HAMMER_BUCKETS;
-            const ring = getOrCreate(user.targets, targetKey, hammer.maxTargetsPerUser, () =>
-                createRing(HAMMER_BUCKETS, Math.floor(now / slotMs)),
+            const ring = getOrCreate(
+                user.targets,
+                targetKey,
+                hammer.maxTargetsPerUser,
+                () => createRing(HAMMER_BUCKETS, Math.floor(now / slotMs)),
+                idleAfter(hammer.windowSeconds),
             );
             const count = addToRing(ring, now, slotMs);
             push(
@@ -689,7 +722,13 @@ export class AbuseBlockerState {
             if (sweep.enabled) {
                 const network = getNetworkKey(destinationIp, sweep.ipv4Prefix, sweep.ipv6Prefix);
                 if (network) {
-                    const state = getOrCreate(user.networks, port, 1024, createMemberSet);
+                    const state = getOrCreate(
+                        user.networks,
+                        port,
+                        1024,
+                        createMemberSet,
+                        idleAfter(sweep.windowSeconds),
+                    );
                     const count = touchMember(
                         state,
                         network,
@@ -723,7 +762,13 @@ export class AbuseBlockerState {
 
         const domainSweep = config.domains.sweep;
         if (domainSweep.enabled) {
-            const state = getOrCreate(user.domainSweep, port, 1024, createMemberSet);
+            const state = getOrCreate(
+                user.domainSweep,
+                port,
+                1024,
+                createMemberSet,
+                idleAfter(domainSweep.windowSeconds),
+            );
             const count = touchMember(
                 state,
                 domainHash,
@@ -749,6 +794,7 @@ export class AbuseBlockerState {
                 domainHash,
                 subdomainSweep.maxDomainsPerUser,
                 createMemberSet,
+                idleAfter(subdomainSweep.windowSeconds),
             );
             const count = touchMember(
                 state,
