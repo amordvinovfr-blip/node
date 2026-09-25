@@ -1,0 +1,9 @@
+{
+  "mode": "block",
+  "ruleSet": "legacy",
+  "scanPorts": [],
+  "confirmationSeconds": 0,
+  "rearmAfterCooldown": false,
+  "sourceGuards": { "enabled": false },
+  "domains": { "enabled": false }
+}
