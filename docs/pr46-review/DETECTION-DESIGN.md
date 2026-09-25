@@ -260,6 +260,15 @@ patched rules above 50,000 lines per second in the harness:
 Normal users touch few recon ports, so the typical cost per user stays small.
 The worst case is a scanner, and scanners are few.
 
+- **Idle keys expire.** A key with nothing in its window and no running
+  cooldown carries no information. It is dropped from the old end of its
+  per-user LRU before a new key is added, which changes no decision.
+- **Why it matters.** Without this, random recon targets slowly filled
+  every user's 64 hammer rings. On a 10-million-line log the heap after GC
+  then grew from 75 to 204 MB; with it, it stays flat at 59 MB.
+- **The PR head's own state** grows the same way, up to `maxKeysPerUser`
+  (256) keys per user: 87 to 362 MB on the same log.
+
 ## Targets for the operator's real-data re-run
 
 These are targets to measure, not promises:

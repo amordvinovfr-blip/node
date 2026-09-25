@@ -563,20 +563,29 @@ block.
 - **Measured on a generated 10-million-line entry-node log**
   (`tools/pr46-replay/bench.js`), with a 512 MB heap cap:
 
-  | Run | Lines per second | Heap |
+  | Run | Lines per second | Heap after GC, at 1 M then 10 M lines |
   |---|---:|---|
-  | patched only, 512 MB cap | 55,022 | finished at 320 MB, before GC |
-  | PR head only, 512 MB cap | 72,302 | finished at 389 MB, before GC |
-  | both (`--compare`), 512 MB cap | out of memory after about 5 minutes | the two states together need more than 512 MB |
+  | patched only, 512 MB cap | 55,990 | 59 MB, then 59 MB (flat) |
+  | PR head only | 72,302 | 87 MB, rising to 362 MB |
+  | both (`--compare`), 1 GB cap | 34,276 | 102 MB, rising to 377 MB (the head's state) |
 
-  After-GC heap samples every 1 M lines, and a `--compare` run with a 1 GB
-  cap, are still running and will be added here.
+  The heap figures come from `--heap-samples 1000000`, which forces a GC
+  every million lines.
 
-  **The PR head's state is bounded but large.** It keeps one detector key
-  per (port, /24) per user, up to `maxKeysPerUser` (256), and stale keys
-  leave only through the LRU. On this log, 4,000 users grew it to about
-  390 MB; the worst case is `maxTrackedUsers x maxKeysPerUser` keys. The
-  patched rules keep keys for recon ports only.
+- **The PR head's state is bounded, but large and still growing.**
+  - It keeps one detector key per (port, /24) per user, up to
+    `maxKeysPerUser` (256). Stale keys leave only through that LRU.
+  - On this log, 4,000 users grew it linearly to 362 MB in 10 M lines, about
+    one day of one entry node. The ceiling is `maxTrackedUsers x
+    maxKeysPerUser` keys.
+  - A month-long `--compare` run therefore needs a larger heap for the head
+    variant (`--max-old-space-size=2048` is suggested). A patched-only run
+    does not.
+- **The patched rules.**
+  - They keep keys for recon ports only.
+  - A key with nothing in its window and no running cooldown is dropped
+    before a new one is added.
+  - Their state stays flat instead of filling up to the caps.
 
 **The real-data comparison is pending with the operator**, using the exact
 command and success criteria in `tools/pr46-replay/README.md`.

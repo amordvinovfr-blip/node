@@ -30,6 +30,11 @@ node tools/pr46-replay/run.js --log /path/to/access.log* --out report.json --com
 - **One node per run.** Replay a whole month continuously; memory is bounded
   (see below), so there is no need to split by day. If you merge several
   nodes into one run, pass `--nodes <n>` so the per-node-day rates stay right.
+- **Heap.** The PR head's own state grows up to `maxKeysPerUser` (256)
+  keys per user (362 MB after 10 M lines with 4,000 users). For a month-long
+  `--compare` run, start Node with `--max-old-space-size=2048`, that is
+  `node --max-old-space-size=2048 tools/pr46-replay/run.js ...`. The patched
+  variant alone stays flat, at about 60 MB on that log.
 - **Block mode.** The patched variant runs with `mode: block` (`--patched-mode block`,
   the default) so the report shows what blocking *would* do. The shipped
   default is `mode: report`.
@@ -46,7 +51,9 @@ node tools/pr46-replay/run.js --log /path/to/access.log* --out report.json --com
   - `--config-patched tools/pr46-replay/configs/pr46-head-equivalent.json`
     makes the patched code behave exactly like the PR head;
   - `--variant head|patched` runs a single variant;
-  - `--open-loop` and `--sub-second` work as before.
+  - `--open-loop` and `--sub-second` work as before;
+  - `--heap-samples <n>` forces a GC every n lines and records the heap
+    (`harness.heapAfterGcMb`).
 
 ### Which numbers decide success
 
@@ -59,7 +66,7 @@ For each entry node, compare `variants.head` with `variants.patched` in
 | at least 80% of those blocks on recon ports | `variants.patched.blocks.onReconPortsShare` |
 | at least 80% of confirmed sweeps and hammers reach `alert` or higher | match your incidents against `report.decisions.jsonl` (`variant: "patched"`, same node, ±1 h, same port; severity `alert` or `blocked`), as in the previous recall table |
 | 50,000 lines per second or more | `run.linesPerSecond` of a `--variant patched` run (`--compare` runs both variants and is slower) |
-| memory bounded on a month of one node | `run.heapUsedMb`; the run should also finish under `node --max-old-space-size=1024` |
+| memory bounded on a month of one node | a `--variant patched` run with `--heap-samples 10000000`: `harness.heapAfterGcMb` should stay flat, and the run should finish under `node --max-old-space-size=1024` |
 
 Useful context in the same report:
 
