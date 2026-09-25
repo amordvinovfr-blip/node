@@ -7,8 +7,10 @@ const zlib = require('node:zlib');
 const { installFakeClock } = require('./fake-clock');
 const { loadPr } = require('./load-pr');
 const { parseLine, toWebhook } = require('./parse-log');
-const { ReportBuilder } = require('./report');
+const { InputStats, VariantStats } = require('./stats');
 const { classifyPort } = require('./traffic-class');
+
+const WEB_PORTS = new Set([80, 443]);
 
 /**
  * Stands in for NftService. The PR's XrayWebhookHandler calls
@@ -18,7 +20,7 @@ const { classifyPort } = require('./traffic-class');
 class BlockRecorder {
     constructor(clock) {
         this.clock = clock;
-        this.calls = [];
+        this.calls = 0;
         this.blockedUntil = new Map();
         this.lastCallWasRepeat = false;
     }
@@ -30,7 +32,7 @@ class BlockRecorder {
         const repeat = this.isBlocked(ip, at);
         if (!repeat) this.blockedUntil.set(ip, at + timeoutSeconds * 1000);
         this.lastCallWasRepeat = repeat;
-        this.calls.push({ ip, at, timeoutSeconds, repeat });
+        this.calls += 1;
     }
 
     async blockIp() {
@@ -39,7 +41,10 @@ class BlockRecorder {
 
     isBlocked(ip, at) {
         const until = this.blockedUntil.get(ip);
-        return until !== undefined && until > at;
+        if (until === undefined) return false;
+        if (until > at) return true;
+        this.blockedUntil.delete(ip);
+        return false;
     }
 }
 
@@ -54,128 +59,217 @@ const silentLogger = (counters) => ({
     },
 });
 
-class ReplayEngine {
-    /**
-     * @param {object} options
-     * @param {object} [options.abuseBlocker] overrides merged into `{ enabled: true }`
-     *   and parsed with the PR's NodePluginSchema (defaults come from the schema).
-     * @param {boolean} [options.closedLoop=true] drop later events from a source IP
-     *   while the recorder has it blocked, as nftables would.
-     * @param {boolean} [options.subSecond=false] keep log sub-second precision instead
-     *   of Xray's whole-second webhook `ts`.
-     * @param {(decision: object) => void} [options.onDecision]
-     * @param {string} [options.scenario]
-     */
-    constructor(options = {}) {
-        this.options = {
-            abuseBlocker: {},
-            closedLoop: true,
-            subSecond: false,
-            onDecision: () => {},
-            scenario: null,
-            ...options,
-        };
-        this.pr = loadPr();
-        this.counters = { handlerErrors: 0 };
-        this.pr.Logger.overrideLogger(silentLogger(this.counters));
+/** One detector variant (PR head or patched) with its own state, recorder and stats. */
+class VariantEngine {
+    constructor({ variant, abuseBlocker, clock, closedLoop, onDecision }) {
+        this.variant = variant;
+        this.pr = loadPr(variant);
+        this.clock = clock;
+        this.closedLoop = closedLoop;
+        this.onDecision = onDecision;
 
-        const parsed = this.pr.NodePluginSchema.parse({
-            abuseBlocker: { enabled: true, ...this.options.abuseBlocker },
-        });
-        this.config = parsed.abuseBlocker;
+        this.config = this.pr.NodePluginSchema.parse({
+            abuseBlocker: { enabled: true, ...abuseBlocker },
+        }).abuseBlocker;
         const lists = this.config.ignoreLists;
         const shared = [...lists.sourceIp, ...lists.destinationIp].filter((ip) => ip.startsWith('ext:'));
         if (shared.length > 0) {
             throw new Error(`Shared lists are not resolved by the harness; inline them: ${shared}`);
         }
 
-        // Mirrors the ignore checks at the top of AbuseBlockerState.analyze(),
-        // only to label the report; the PR code still makes the decision.
+        this.pluginState = this.pr.createPluginState();
+        this.state = this.pluginState.abuseBlocker;
+        this.state.configure({
+            config: this.config,
+            configFingerprint: `pr46-replay-${variant}`,
+            ignoredUsers: lists.userId.map(String),
+            ignoredSources: lists.sourceIp,
+            ignoredDestinations: lists.destinationIp,
+        });
+        this.state.setCoverage('full', 0);
+        this.recorder = new BlockRecorder(clock);
+        this.handler = new this.pr.XrayWebhookHandler(this.pluginState, this.recorder);
+        this.stats = new VariantStats({
+            name: variant,
+            policy: this.state.policy,
+            closedLoop,
+        });
+
+        // Mirrors the first checks of AbuseBlockerState.analyze(), only to label
+        // the report; the PR code still makes every decision.
         const ignoredUsers = new Set(lists.userId.map(String));
         const ignoredSources = new this.pr.IpMatcher(lists.sourceIp);
         const ignoredDestinations = new this.pr.IpMatcher(lists.destinationIp);
         this.isIgnored = (observation) =>
             ignoredUsers.has(observation.userId) ||
             ignoredSources.matches(observation.sourceIp) ||
-            ignoredDestinations.matches(observation.destinationIp);
-
-        this.pluginState = new this.pr.PluginStateService();
-        this.pluginState.abuseBlocker.configure({
-            config: this.config,
-            configFingerprint: 'pr46-replay',
-            ignoredUsers: lists.userId.map(String),
-            ignoredSources: lists.sourceIp,
-            ignoredDestinations: lists.destinationIp,
-        });
-        this.pluginState.abuseBlocker.setCoverage('full', 0);
-
-        this.clock = installFakeClock(0);
-        this.recorder = new BlockRecorder(this.clock);
-        this.handler = new this.pr.XrayWebhookHandler(this.pluginState, this.recorder);
-        this.report = new ReportBuilder({
-            scenario: this.options.scenario,
-            policy: this.pluginState.abuseBlocker.policy,
-            closedLoop: this.options.closedLoop,
-            subSecond: this.options.subSecond,
-        });
-        this.lastTimestampMs = Number.NEGATIVE_INFINITY;
-        this.finished = false;
+            (observation.destinationIp !== null && ignoredDestinations.matches(observation.destinationIp));
+        this.excludedPorts = new Set(this.config.excludedPorts);
+        this.scanPorts = new Set(variant === 'patched' ? this.config.scanPorts : []);
+        this.v2 = variant === 'patched' && this.config.ruleSet !== 'legacy';
     }
 
-    sourceIpOf(record) {
-        return this.pr.parseNetworkEndpoint(record.source)?.ip ?? null;
+    observationOf(webhook) {
+        if (this.variant === 'head') return this.pr.toAbuseBlockerObservation(webhook);
+        return this.pr.toAbuseBlockerObservation(webhook, { domains: this.state.acceptsDomains });
     }
 
-    /** Feeds one parsed log record. Records must arrive in timestamp order. */
-    async process(record) {
-        if (record.timestampMs < this.lastTimestampMs) this.report.observeLate();
-        this.lastTimestampMs = Math.max(this.lastTimestampMs, record.timestampMs);
+    label(record, observation) {
+        const stats = this.stats;
+        if (!observation) {
+            if (record.network !== 'tcp') stats.observeScoring('filteredNotTcp');
+            else if (!record.email || !/^\d+$/.test(record.email)) stats.observeScoring('filteredNoNumericEmail');
+            else stats.observeScoring('filteredNoIpTarget');
+            return;
+        }
+        if (this.isIgnored(observation)) {
+            stats.observeScoring('ignoredByList');
+            return;
+        }
+        const port = observation.destinationPort;
+        const excluded = this.excludedPorts.has(port);
+        const inScope = this.scanPorts.size > 0 ? this.scanPorts.has(port) : !excluded;
+        if (observation.destinationHost) {
+            stats.observeDomain('observed');
+            if (this.v2 && inScope && this.config.domains.enabled && !WEB_PORTS.has(port)) {
+                stats.observeDomain('reachedDomainRules');
+            }
+            if (this.v2 && !excluded && this.config.sessionRateBurst.enabled) {
+                stats.observeDomain('countedBySessionRate');
+            }
+        }
+        if (excluded && !inScope) stats.observeScoring('excludedPort');
+        else if (!inScope) stats.observeScoring('outsideScanPorts');
+        else stats.observeScoring('analyzed', port);
+    }
 
-        const sourceIp = this.sourceIpOf(record);
-        this.report.observeRecord(record, sourceIp);
-        if (record.status !== 'accepted') return;
-
-        if (
-            this.options.closedLoop &&
-            sourceIp &&
-            this.recorder.isBlocked(sourceIp, record.timestampMs)
-        ) {
-            this.report.observeDroppedWhileBlocked(record, sourceIp);
+    async process(record, sourceIp, webhook, input) {
+        if (this.closedLoop && sourceIp && this.recorder.isBlocked(sourceIp, record.timestampMs)) {
+            this.stats.observeDroppedWhileBlocked(record, sourceIp);
             return;
         }
 
-        const webhook = toWebhook(record, { subSecond: this.options.subSecond });
-        this.report.observeScoringInput(
-            record,
-            this.pr.toAbuseBlockerObservation(webhook),
-            this.config.excludedPorts,
-            this.isIgnored,
-        );
+        const observation = this.observationOf(webhook);
+        this.label(record, observation);
+        // The handler returns right after the same mapping when it yields null,
+        // so skipping it changes nothing but saves the schema parse.
+        if (!observation) return;
 
-        this.clock.set(record.timestampMs);
-        const callsBefore = this.recorder.calls.length;
+        const callsBefore = this.recorder.calls;
         await this.handler.handle(new this.pr.XrayWebhookEvent(webhook, 'abuse'));
 
-        const reports = this.pluginState.abuseBlocker.flushReports();
-        for (const report of reports) {
+        for (const report of this.state.flushReports()) {
             const blocked = report.actionReport.action === 'ip_block';
+            const rules = report.detections.map((detection) => detection.rule);
             const decision = {
+                variant: this.variant,
                 time: report.detectedAt.toISOString(),
                 userId: report.userId,
                 sourceIp: report.sourceIp,
-                rule: report.detections.map((detection) => detection.rule).join('+'),
-                score: report.score.after,
-                action: blocked ? 'block' : 'report',
-                severity: report.severity,
+                destinationIp: report.destinationIp,
+                destinationHost: report.destinationHost ?? null,
                 destinationPort: report.destinationPort,
                 trafficClass: classifyPort(report.destinationPort),
+                rule: rules.join('+'),
+                rules,
+                phases: report.detections.map((detection) => detection.phase ?? 'single'),
                 keys: report.detections.map((detection) => detection.key),
-                repeat: blocked && this.recorder.calls.length > callsBefore
-                    ? this.recorder.lastCallWasRepeat
-                    : false,
+                counts: report.detections.map((detection) => detection.count ?? detection.uniqueDestinations),
+                score: report.score.after,
+                severity: report.severity,
+                action: blocked ? 'block' : 'report',
+                skipReason: report.actionReport.skipReason ?? null,
+                sourceIpUserCount: report.sourceIpUserCount ?? null,
+                repeat:
+                    blocked && this.recorder.calls > callsBefore ? this.recorder.lastCallWasRepeat : false,
             };
-            this.options.onDecision(decision);
-            this.report.observeDecision(decision, record.timestampMs);
+            this.onDecision(decision);
+            this.stats.observeDecision(decision, record.timestampMs, input);
+        }
+    }
+}
+
+/**
+ * Drives one or more variants over the same records in timestamp order, with
+ * one replay clock and one set of input statistics.
+ */
+class Replay {
+    /**
+     * @param {object} options
+     * @param {Array<'head' | 'patched'>} [options.variants=['patched']]
+     * @param {object} [options.abuseBlocker] settings for every variant
+     * @param {{ head?: object, patched?: object }} [options.configs] per-variant settings
+     * @param {'block' | 'report' | null} [options.patchedMode] forces the patched `mode`
+     * @param {boolean} [options.closedLoop=true] drop events from an IP while it is blocked
+     * @param {boolean} [options.subSecond=false] keep sub-second log timestamps
+     * @param {(decision: object) => void} [options.onDecision]
+     * @param {number} [options.nodes=1] nodes merged into this input, for per-node-day rates
+     */
+    constructor(options = {}) {
+        this.options = {
+            variants: ['patched'],
+            abuseBlocker: {},
+            configs: {},
+            patchedMode: null,
+            closedLoop: true,
+            subSecond: false,
+            onDecision: () => {},
+            nodes: 1,
+            scenario: null,
+            maxSources: 200_000,
+            ...options,
+        };
+        this.counters = { handlerErrors: 0 };
+        this.clock = installFakeClock(0);
+        this.finished = false;
+        try {
+            this.input = new InputStats({ maxSources: this.options.maxSources });
+            this.engines = this.options.variants.map((variant) => {
+                const engine = new VariantEngine({
+                    variant,
+                    abuseBlocker: {
+                        ...this.options.abuseBlocker,
+                        ...this.options.configs[variant],
+                        ...(variant === 'patched' && this.options.patchedMode
+                            ? { mode: this.options.patchedMode }
+                            : {}),
+                    },
+                    clock: this.clock,
+                    closedLoop: this.options.closedLoop,
+                    onDecision: this.options.onDecision,
+                });
+                engine.pr.Logger.overrideLogger(silentLogger(this.counters));
+                return engine;
+            });
+            this.parseEndpoint = this.engines[0].pr.parseNetworkEndpoint;
+        } catch (error) {
+            this.close();
+            throw error;
+        }
+        this.lastTimestampMs = Number.NEGATIVE_INFINITY;
+    }
+
+    observeLine(line) {
+        this.input.lines.total += 1;
+        const record = parseLine(line);
+        if (!record && line.trim().length > 0) this.input.lines.unparsed += 1;
+        return record;
+    }
+
+    /** Feeds one parsed record. Records should arrive in timestamp order. */
+    async process(record) {
+        if (record.timestampMs < this.lastTimestampMs) this.input.lines.lateReordered += 1;
+        this.lastTimestampMs = Math.max(this.lastTimestampMs, record.timestampMs);
+
+        const sourceIp = this.parseEndpoint(record.source)?.ip ?? null;
+        const destinationIsIp = this.parseEndpoint(record.destination) !== null;
+        this.input.observeRecord(record, sourceIp, destinationIsIp);
+        if (record.status !== 'accepted') return;
+
+        const webhook = toWebhook(record, { subSecond: this.options.subSecond });
+        this.clock.set(record.timestampMs);
+        for (const engine of this.engines) {
+            await engine.process(record, sourceIp, webhook, this.input);
         }
     }
 
@@ -187,12 +281,30 @@ class ReplayEngine {
 
     finish({ decisionsPath } = {}) {
         this.close();
-        const built = this.report.build({ decisionsPath });
-        built.harness = {
-            handlerErrors: this.counters.handlerErrors,
-            recorderCalls: this.recorder.calls.length,
+        const variants = {};
+        for (const engine of this.engines) {
+            variants[engine.variant] = {
+                ...engine.stats.build(this.input, { nodes: this.options.nodes }),
+                harness: { recorderCalls: engine.recorder.calls },
+            };
+        }
+        return {
+            scenario: this.options.scenario,
+            generatedBy: 'tools/pr46-replay (PR #46 XrayWebhookHandler + AbuseBlockerState)',
+            mode: {
+                variants: this.options.variants,
+                patchedMode: this.options.patchedMode,
+                closedLoop: this.options.closedLoop,
+                nodes: this.options.nodes,
+                timestampResolution: this.options.subSecond
+                    ? 'log (sub-second)'
+                    : 'whole seconds (as Xray webhook ts)',
+            },
+            input: this.input.build(),
+            variants,
+            harness: { handlerErrors: this.counters.handlerErrors },
+            decisionsFile: decisionsPath ?? null,
         };
-        return built;
     }
 }
 
@@ -211,8 +323,10 @@ class ReorderBuffer {
     }
 
     less(a, b) {
-        return a.record.timestampMs < b.record.timestampMs ||
-            (a.record.timestampMs === b.record.timestampMs && a.sequence < b.sequence);
+        return (
+            a.record.timestampMs < b.record.timestampMs ||
+            (a.record.timestampMs === b.record.timestampMs && a.sequence < b.sequence)
+        );
     }
 
     push(item) {
@@ -249,70 +363,86 @@ class ReorderBuffer {
     }
 }
 
-/**
- * Replays an in-memory array of log lines (sorted by timestamp, stable).
- */
+/** Replays an in-memory array of log lines (sorted by timestamp, stable). */
 const replayLines = async (lines, options = {}) => {
-    const engine = new ReplayEngine(options);
-    const parsed = [];
+    const replay = new Replay(options);
+    const records = [];
     for (const line of lines) {
-        engine.report.observeLine();
-        const record = parseLine(line);
-        if (record) parsed.push(record);
-        else if (line.trim().length > 0) engine.report.observeUnparsed();
+        const record = replay.observeLine(line);
+        if (record) records.push(record);
     }
-    parsed.sort((a, b) => a.timestampMs - b.timestampMs);
+    records.sort((a, b) => a.timestampMs - b.timestampMs);
     try {
-        for (const record of parsed) await engine.process(record);
+        for (const record of records) await replay.process(record);
     } finally {
-        engine.close();
+        replay.close();
     }
-    return engine.finish(options);
+    return replay.finish(options);
 };
 
 const openLines = (file) => {
-    let stream = fs.createReadStream(file);
+    let stream = file === '-' ? process.stdin : fs.createReadStream(file);
     if (file.endsWith('.gz')) stream = stream.pipe(zlib.createGunzip());
     return readline.createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
 };
 
+/** First parseable timestamp of a file, to order rotated logs (null if none). */
+const firstTimestamp = async (file) => {
+    if (file === '-') return null;
+    const lines = openLines(file);
+    let seen = 0;
+    try {
+        for await (const line of lines) {
+            const record = parseLine(line);
+            if (record) return record.timestampMs;
+            if (++seen > 1000) return null;
+        }
+        return null;
+    } finally {
+        lines.close();
+    }
+};
+
+/** Orders files by their first timestamp; files without one keep their place at the end. */
+const sortFilesByTime = async (files) => {
+    const stamped = await Promise.all(
+        files.map(async (file, index) => ({ file, index, first: await firstTimestamp(file) })),
+    );
+    return stamped
+        .sort((a, b) => (a.first ?? Infinity) - (b.first ?? Infinity) || a.index - b.index)
+        .map((entry) => entry.file);
+};
+
 /**
- * Streams one or more access.log files (optionally .gz) in the given order.
- * Lines are reordered within `reorderWindowMs` so that small out-of-order
- * writes are replayed in timestamp order.
+ * Streams access.log files (optionally .gz, or '-' for stdin). Files are
+ * ordered by their first timestamp unless `sortFiles` is false, and lines are
+ * reordered within `reorderWindowMs`.
  */
 const replayFiles = async (files, options = {}) => {
     const reorderWindowMs = options.reorderWindowMs ?? 2000;
-    const engine = new ReplayEngine(options);
+    const ordered = options.sortFiles === false ? files : await sortFilesByTime(files);
+    const replay = new Replay(options);
     const buffer = new ReorderBuffer();
     let sequence = 0;
     let maxSeen = Number.NEGATIVE_INFINITY;
 
     try {
-        for (const file of files) {
+        for (const file of ordered) {
             for await (const line of openLines(file)) {
-                engine.report.observeLine();
-                const record = parseLine(line);
-                if (!record) {
-                    if (line.trim().length > 0) engine.report.observeUnparsed();
-                    continue;
-                }
+                const record = replay.observeLine(line);
+                if (!record) continue;
                 buffer.push({ record, sequence: sequence++ });
-                maxSeen = Math.max(maxSeen, record.timestampMs);
-                while (
-                    buffer.size > 0 &&
-                    buffer.peek().record.timestampMs <= maxSeen - reorderWindowMs
-                ) {
-                    await engine.process(buffer.pop().record);
+                if (record.timestampMs > maxSeen) maxSeen = record.timestampMs;
+                while (buffer.size > 0 && buffer.peek().record.timestampMs <= maxSeen - reorderWindowMs) {
+                    await replay.process(buffer.pop().record);
                 }
             }
         }
-        while (buffer.size > 0) await engine.process(buffer.pop().record);
+        while (buffer.size > 0) await replay.process(buffer.pop().record);
     } finally {
-        engine.close();
+        replay.close();
     }
-
-    return engine.finish(options);
+    return { report: replay.finish(options), files: ordered };
 };
 
-module.exports = { BlockRecorder, ReplayEngine, replayFiles, replayLines };
+module.exports = { BlockRecorder, Replay, replayFiles, replayLines, sortFilesByTime };

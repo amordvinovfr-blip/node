@@ -7,14 +7,14 @@
 const assert = require('node:assert/strict');
 const { describe, it } = require('node:test');
 
-const { replayLines } = require('../lib/replay');
 const { SCENARIOS } = require('../scenarios');
+const { replayVariant } = require('./helpers');
 
 const byId = new Map(SCENARIOS.map((scenario) => [scenario.id, scenario]));
 
 const run = async (id) => {
     const decisions = [];
-    const report = await replayLines(byId.get(id).generate().lines, {
+    const report = await replayVariant(byId.get(id).generate().lines, 'head', {
         scenario: id,
         onDecision: (decision) => decisions.push(decision),
     });

@@ -11,6 +11,7 @@ const { describe, it } = require('node:test');
 const { BASE_MS, addr, formatLine } = require('../fixtures/lib');
 const { loadPr } = require('../lib/load-pr');
 const { replayLines } = require('../lib/replay');
+const { replayVariant } = require('./helpers');
 
 const RUN_JS = path.join(__dirname, '..', 'run.js');
 
@@ -29,7 +30,9 @@ const scanLines = ({ email = 42, src = addr.client(1), startMs = BASE_MS } = {})
 describe('replay harness', () => {
     it('drives the PR handler and records the block instead of calling nftables', async () => {
         const decisions = [];
-        const report = await replayLines(scanLines(), { onDecision: (decision) => decisions.push(decision) });
+        const report = await replayVariant(scanLines(), 'head', {
+            onDecision: (decision) => decisions.push(decision),
+        });
 
         assert.deepEqual(
             decisions.map(({ rule, score, action, severity }) => ({ rule, score, action, severity })),
@@ -60,13 +63,13 @@ describe('replay harness', () => {
             formatLine({ ms: BASE_MS + 10_000, src: addr.cgnatPublic, dst: addr.service(1, 1), port: 993, email: 43 }),
             formatLine({ ms: BASE_MS + 700_000, src: addr.cgnatPublic, dst: addr.service(1, 1), port: 993, email: 44 }),
         ];
-        const report = await replayLines(lines);
+        const report = await replayVariant(lines, 'head');
 
         assert.equal(report.blocks.total, 1);
         assert.equal(report.scoringInput.droppedWhileSourceBlocked, 1);
         assert.equal(report.collateral.distinctBystandersDropped, 1);
         assert.equal(report.usersPerBlockedSourceIp.lastHourBeforeBlock.max, 1);
-        assert.equal(report.usersPerBlockedSourceIp.wholeLog.max, 3);
+        assert.equal(report.usersPerBlockedSourceIp.duringBlock.max, 2);
     });
 
     it('in open-loop mode the PR asks to block the same IP again while it is blocked', async () => {
@@ -75,7 +78,7 @@ describe('replay harness', () => {
             ...scanLines(),
             ...scanLines({ startMs: BASE_MS + 400_000 }).map((line) => line.replace(':22 ', ':23 ')),
         ];
-        const report = await replayLines(lines, {
+        const report = await replayVariant(lines, 'head', {
             closedLoop: false,
             onDecision: (decision) => decisions.push(decision),
         });
@@ -117,24 +120,32 @@ describe('replay harness', () => {
     });
 
     it('applies --config overrides through the PR schema, including ignore lists', async () => {
-        const ignored = await replayLines(scanLines(), {
+        const ignored = await replayVariant(scanLines(), 'head', {
             abuseBlocker: { ignoreLists: { sourceIp: ['192.0.2.0/24'] } },
         });
         assert.equal(ignored.decisions.total, 0);
         assert.equal(ignored.scoringInput.ignoredByList, 50);
         assert.equal(ignored.scoringInput.analyzed, 0);
 
-        const stricter = await replayLines(scanLines(), { abuseBlocker: { blockScore: 300 } });
+        const stricter = await replayVariant(scanLines(), 'head', { abuseBlocker: { blockScore: 300 } });
         assert.equal(stricter.policy.blockScore, 300);
         assert.equal(stricter.blocks.total, 0);
         assert.equal(stricter.decisions.bySeverity.alert, 2);
     });
 
     it('report contains aggregates only, no IPs or user IDs', async () => {
-        const report = await replayLines(scanLines({ email: 987654 }));
+        const report = await replayLines(
+            [
+                ...scanLines({ email: 987654 }),
+                formatLine({ ms: BASE_MS + 9000, src: addr.client(3), dst: 'ssh.victim.example', port: 22, email: 987654 }),
+            ],
+            { variants: ['head', 'patched'] },
+        );
         const text = JSON.stringify(report);
+        assert.equal(report.variants.patched.domainDestinations.observed, 1);
         assert.doesNotMatch(text, /\d+\.\d+\.\d+\.\d+/);
         assert.doesNotMatch(text, /987654/);
+        assert.doesNotMatch(text, /victim/);
     });
 });
 
@@ -160,6 +171,7 @@ describe('run.js CLI', () => {
                 '--allow-fs-read=*',
                 `--allow-fs-write=${dir}`,
                 RUN_JS,
+                '--compare',
                 '--log',
                 log,
                 '--out',
@@ -172,18 +184,20 @@ describe('run.js CLI', () => {
         const report = JSON.parse(fs.readFileSync(out, 'utf8'));
         assert.equal(report.input.total, 53);
         assert.equal(report.input.unparsed, 1);
-        assert.equal(report.scoringInput.filteredNotTcp, 1);
-        assert.equal(report.scoringInput.filteredNoNumericEmail, 1);
-        assert.equal(report.blocks.total, 1);
+        const head = report.variants.head;
+        assert.equal(head.scoringInput.filteredNotTcp, 1);
+        assert.equal(head.scoringInput.filteredNoNumericEmail, 1);
+        assert.equal(head.blocks.total, 1);
+        assert.equal(report.variants.patched.blocks.total, 0);
 
         const decisions = fs
             .readFileSync(path.join(dir, 'report.decisions.jsonl'), 'utf8')
             .trim()
             .split('\n')
             .map((line) => JSON.parse(line));
-        assert.equal(decisions.length, 2);
+        assert.equal(decisions.filter((decision) => decision.variant === 'head').length, 2);
         for (const decision of decisions) {
-            for (const key of ['time', 'userId', 'sourceIp', 'rule', 'score', 'action']) {
+            for (const key of ['variant', 'time', 'userId', 'sourceIp', 'rule', 'score', 'action']) {
                 assert.ok(key in decision, `decision has ${key}`);
             }
         }

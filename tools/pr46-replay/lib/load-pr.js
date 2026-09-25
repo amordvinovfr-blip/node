@@ -13,8 +13,15 @@ const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const NODE_MODULES = path.join(REPO_ROOT, 'node_modules');
+// Verbatim copies of the PR head (2e47450) versions of the files the detector
+// patch changes, laid out like the repo. Their other imports resolve to the repo.
+const PR_HEAD_ROOT = path.resolve(__dirname, '..', 'pr-head');
 
-let loaded = null;
+const loaded = new Map();
+let installed = false;
+
+const existsAsModule = (candidate) =>
+    ['', '.ts', '.js', `${path.sep}index.ts`].some((suffix) => fs.existsSync(`${candidate}${suffix}`));
 
 const requireFromRepo = (request) => require(require.resolve(request, { paths: [REPO_ROOT] }));
 
@@ -49,6 +56,8 @@ const readAliases = (ts) => {
 };
 
 const install = () => {
+    if (installed) return;
+    installed = true;
     const ts = requireFromRepo('typescript');
     const aliases = readAliases(ts);
 
@@ -67,6 +76,13 @@ const install = () => {
     Module._resolveFilename = function resolve(request, parent, ...rest) {
         const stubId = stubIds.get(request);
         if (stubId) return stubId;
+
+        if (request.startsWith('.') && parent?.filename?.startsWith(PR_HEAD_ROOT)) {
+            const candidate = path.resolve(path.dirname(parent.filename), request);
+            if (!existsAsModule(candidate)) {
+                request = path.join(REPO_ROOT, path.relative(PR_HEAD_ROOT, candidate));
+            }
+        }
 
         for (const alias of aliases) {
             if (request.startsWith(alias.prefix)) {
@@ -101,35 +117,49 @@ const install = () => {
 
 /**
  * Returns the PR's real runtime pieces used by the harness.
+ * `patched`: the code on this branch. `head`: the PR #46 head detector files
+ * from pr-head/, sharing every other module with the branch.
  */
-const loadPr = () => {
-    if (loaded) return loaded;
+const loadPr = (variant = 'patched') => {
+    if (loaded.has(variant)) return loaded.get(variant);
+    if (variant !== 'patched' && variant !== 'head') throw new Error(`Unknown variant ${variant}`);
     install();
 
     requireFromRepo('reflect-metadata');
     const { Logger } = requireFromRepo('@nestjs/common');
+    const root = variant === 'head' ? PR_HEAD_ROOT : REPO_ROOT;
     const src = (relative) => require(path.join(REPO_ROOT, relative));
+    const variantSrc = (relative) => require(path.join(root, relative));
 
-    const handlerModule = src('src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts');
+    const handlerModule = variantSrc('src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts');
+    const { AbuseBlockerState } = variantSrc('src/modules/_plugin/services/states/abuse-blocker.state.ts');
     const { XrayWebhookEvent } = src('src/modules/_plugin/events/xray-webhook/xray-webhook.event.ts');
     const { PluginStateService } = src('src/modules/_plugin/services/plugin-state.service.ts');
-    const { AbuseBlockerState } = src('src/modules/_plugin/services/states/abuse-blocker.state.ts');
     const { IpMatcher, parseNetworkEndpoint } = src('src/modules/_plugin/utils/ip-address.utils.ts');
     const { NodePluginSchema } = requireFromRepo('@remnawave/node-plugins');
 
-    loaded = {
+    const result = {
+        variant,
         REPO_ROOT,
         Logger,
         XrayWebhookHandler: handlerModule.XrayWebhookHandler,
         toAbuseBlockerObservation: handlerModule.toAbuseBlockerObservation,
         XrayWebhookEvent,
-        PluginStateService,
         AbuseBlockerState,
         IpMatcher,
         parseNetworkEndpoint,
         NodePluginSchema,
+        /** The handler only reads `abuseBlocker` (and `torrentBlocker` for other targets). */
+        createPluginState: () => {
+            if (variant === 'patched') return new PluginStateService();
+            return { abuseBlocker: new AbuseBlockerState(), torrentBlocker: { isEnabled: false } };
+        },
     };
-    return loaded;
+    loaded.set(variant, result);
+    return result;
 };
 
-module.exports = { loadPr, REPO_ROOT };
+/** Makes plain `require()` of the repo's .ts files work (used to run the PR's own tests). */
+const installTsHook = () => install();
+
+module.exports = { loadPr, installTsHook, REPO_ROOT, PR_HEAD_ROOT };

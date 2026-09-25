@@ -47,7 +47,9 @@ const parseLine = (line) => {
 
 /**
  * Builds the XrayWebhookModel for a parsed line. `ts` is whole seconds, like
- * Xray's `time.Now().Unix()`, unless `subSecond` is set.
+ * Xray's `time.Now().Unix()`, unless `subSecond` is set. The log's destination
+ * is the requested target, which Xray also puts into `originalTarget`
+ * (DETECTION-FACTS.md §2); a sniffed domain is not in the log.
  */
 const toWebhook = (record, { subSecond = false } = {}) => ({
     email: record.email,
@@ -57,7 +59,7 @@ const toWebhook = (record, { subSecond = false } = {}) => ({
     source: record.source,
     destination: record.destination,
     routeTarget: null,
-    originalTarget: null,
+    originalTarget: record.network === 'unknown' ? null : `${record.network}:${record.destination}`,
     inboundTag: record.inboundTag,
     inboundName: null,
     inboundLocal: null,
