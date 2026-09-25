@@ -40,6 +40,14 @@ infrastructure. How the blocker works is summarized in
   As expected, on chained exit nodes it blocks the entry node's address.
 - The PR does not build yet: no published `@remnawave/node-plugins` release
   contains the `abuseBlocker` schema.
+- **A tested patch is proposed** in
+  [Proposed detector changes](#proposed-detector-changes):
+  - report-only default and recon-port scope;
+  - sweep, hammer and burst rules with two-pass confirmation;
+  - hostname rules and source guards.
+
+  On synthetic data it removes every false block, and every true positive
+  still reaches `alert` or higher. The real-data comparison is pending.
 
 ## Build status (as-is)
 
@@ -411,6 +419,168 @@ These are minimal and ordered by how much risk they remove.
    - applying a changed plugin config calls `recreateTables()` and clears all
      active abuse blocks. That may be intended, but it is worth documenting.
 
+## Proposed detector changes
+
+Branch `review/pr46-detection` turns the suggestions above into a tested
+patch to the PR's own files: `abuse-blocker.state.ts`,
+`xray-webhook.handler.ts`, the report contract and the `abuseBlocker` plugin
+schema. [DETECTION-DESIGN.md](DETECTION-DESIGN.md) has the details.
+`docs/pr46-review/detection.patch` is the diff against the PR head, and
+`detection-node-plugins.patch` is the schema diff for `libs/node-plugins`.
+
+### Facts from Xray (v26.7.28)
+
+See [DETECTION-FACTS.md](DETECTION-FACTS.md) for file:line references.
+
+- **A request by name never carries an IP.** The routing webhook reports
+  `destination: "example.com:443"` and `originalTarget:
+  "tcp:example.com:443"`. It is fired with the unresolved routing context,
+  even when `IPIfNonMatch` or `IPOnDemand` resolved the name for rule
+  matching. The freedom outbound resolves only later. The 68-81% of TCP
+  sessions that the PR drops are therefore invisible to IP rules on the node
+  itself, not only in the harness.
+- **When the client connected by IP,** that IP is always in
+  `originalTarget`, whatever the sniffing settings.
+- **Abuse webhooks are not deduplicated.** Xray deduplicates per `email`
+  only when `deduplication > 0`, and PR #46 sets 0. Every matched TCP
+  connection is posted, so session-rate rules are feasible. Delivery is
+  best-effort (one goroutine per event, 5 s timeout, no retry), so counts are
+  lower bounds.
+
+### What changes
+
+- **Report-only by default** (`mode: "report"`). The new rule set is the
+  default (`ruleSet: "v2"`); the PR #46 rules stay available (`legacy`, or
+  `both` for A/B). `configs/pr46-head-equivalent.json` reproduces the PR head
+  exactly, and a test checks this on every scenario.
+- **Recon-port scope** (`scanPorts`, 56 ports, a `Set`). No other port can
+  lead to a block. They feed only the report-only session counter.
+- **Latch fix.** A key that stays above its threshold fires again after the
+  cooldown.
+- **New rules**, each with a candidate report and then a confirmation at
+  least 60 s later, which is the only way to reach a block:
+  - `horizontal_sweep`: 150 distinct /24s (IPv6 /48) per user and recon port
+    in 15 minutes;
+  - `hammer_target`: 300 sessions to one IP or hostname on a recon port in
+    15 minutes;
+  - `session_rate_burst`: 600 non-web sessions per minute. Report-only.
+- **Hostname destinations**, never resolved, stored as hashes. Registrable
+  domains come from `tldts`.
+  - `hammer_target` also counts by hostname;
+  - `horizontal_sweep_domains`: 50 registrable domains per user and recon
+    port in 15 minutes;
+  - `subdomain_sweep`: 100 hostnames under one domain in 15 minutes.
+    Report-only, because an administrator's own fleet looks the same.
+- **Source guards.** No block for non-public sources, for sources that
+  carried more than one user in the last hour (`shared_source`), or for
+  listed users or inbounds. Each becomes a report with a `skipReason`.
+- **New report fields:** `sourceIpUserCount`, `inboundTag`,
+  `destinationHost`, and the rule's raw `count`, `unit` and `phase`.
+- **Performance.**
+  - IP validity checks without BigInt;
+  - early exits in the observation mapping;
+  - an LRU eviction that no longer rescans deleted slots. The PR head's user
+    LRU degrades to O(n) per eviction once a node exceeds `maxTrackedUsers`.
+
+### Synthetic before/after
+
+These results come from `node tools/pr46-replay/run-scenarios.js`, with the
+patched rules in block mode to show what they would block. Every row is
+pinned in `test/compare.spec.js`.
+
+| Scenario | PR #46 head | Patched |
+|---|---|---|
+| App peers on :50300 / :8887 (80 new peers per burst, 6 bursts/h) | 2 blocks each | nothing |
+| LAN-sync /24 walks on :53317 and :62078 | 10 blocks | nothing |
+| BitTorrent over TCP (300 peers in 60 s) | `alert` | `alert` from `session_rate_burst` (report-only) |
+| Hostname traffic: 600-name browsing, CDN shards, IMAP by name, 5 SSH jump hosts, tracker announces, game launcher, API poller | nothing | nothing |
+| DNS, NTP, BitTorrent/DHT over UDP, Steam/WebRTC/XMPP, IMAP polling, heavy browsing | nothing | nothing |
+| CGNAT: 50 users on one IP, one sequential SSH scanner | 1 block, 49 other users cut off | confirmed, but `shared_source`: not blocked |
+| Chained exit node, 2,000 people as one user | 2 blocks of the entry node | nothing (would be `non_public_source` anyway) |
+| SSH sweep, random order, 25 / 50 / 500 targets per minute for 15 min | nothing / `suspicious` / `suspicious` | block after confirmation, all three |
+| SSH sweep, 200 /24s in 2 min (random) | `suspicious` | `alert` (too short to confirm) |
+| SSH sweep, sequential, 500 per minute | block after 5 s | block after 507 s |
+| RTSP sweep, 200 /24s per port in 2 min | `alert` | `alert` |
+| RDP hammer, 300 sessions to one IP or hostname | nothing | `alert` |
+| RDP hammer, 400 sessions to one IP or hostname | nothing | block |
+| 700 non-web sessions in 60 s | nothing | `alert` (report-only rule) |
+| SSH scan of 500 hostnames across 400 domains | nothing | block (`horizontal_sweep_domains`) |
+| Subdomain enumeration, 200 names on :22/:3389 | nothing | `alert` (report-only rule) |
+| Telnet scan mixing 300 IPs and 200 hostnames | nothing | block |
+| Random SSH sweep crossing midnight, 20 per minute | nothing | block in one continuous replay; nothing in two per-day halves |
+
+In short:
+
+- **No benign scenario blocks.** The PR head blocked 5 of them.
+- **Every true positive reaches `alert` or higher.** Sustained scans and
+  hammers block after confirmation.
+- **Short bursts only report.** This is intended: the confirmation step
+  trades a slower block for precision.
+
+**Sweep shape.** One user scanning for 15 minutes
+(`node tools/pr46-replay/sensitivity.js`); times are seconds to the first
+block.
+
+| Target order | Ports | Targets/min | PR #46 head | Patched |
+|---|---|---:|---|---|
+| random | 22 | 10 | nothing | nothing |
+| random | 22 | 25 | nothing | block (499 s) |
+| random | 22 | 50 / 100 / 500 / 2000 | `suspicious` | block (275 / 165 / 79 / 65 s) |
+| random | 23, 2323 | 25 | nothing | block (499 s) |
+| random | 23, 2323 | 50 to 2000 | `alert` | block (275 to 65 s) |
+| random | 22, 23, 2323 | 50 / 500 / 2000 | block (59 / 5.9 / 1.5 s) | block (275 / 79 / 65 s) |
+| sequential, whole /24s | 22 | 25 to 500 | block (655 to 5.9 s) | nothing |
+| sequential, whole /24s | 22 | 2000 | block (1.5 s) | `alert` (`session_rate_burst`) |
+
+- **Random sweeps.** The patched rules block every random-order sweep from
+  25 targets per minute up, on one port or several. They block later than the
+  PR head, because they need 150 /24s and then a confirmation.
+- **Dense sequential walks.** A walk that stays inside fewer than 150 /24s in
+  15 minutes is not seen. The operator's own detector does not act on that
+  shape either. `ruleSet: "both"` keeps the PR #46 geometry for it, as
+  reports only.
+
+**Hostname thresholds** (`node tools/pr46-replay/sensitivity-domains.js`):
+
+- **N = 50 registrable domains per recon port.** The busiest benign case,
+  SSH to 8 own servers in 8 domains, stays at 8. Scans fire at these points:
+  - 100 domains in 10 minutes: after about 5 minutes;
+  - 400 domains in 10 minutes: after 74 s;
+  - 200 domains spread over an hour: after about 15 minutes.
+- **M = 100 hostnames under one domain.** An Ansible run over 40 hosts of
+  one domain stays at 40. Enumerating 200 names in 10 or 30 minutes fires.
+  M = 50 would sit close to the Ansible case. The rule is report-only either
+  way.
+
+### Harness changes for the re-run
+
+- **`--compare`.** `run.js --compare` replays the PR head files (kept
+  verbatim in `tools/pr46-replay/pr-head/`) and the patched code side by
+  side, and writes one aggregate report with both result sets.
+- **Memory.** The harness's own per-IP and per-hour state was unbounded; that
+  is what exhausted the 2 GB heap on a month of one node. It is now bounded,
+  so a month replays in one run and scans across midnight are no longer split.
+- **Measured on a generated 10-million-line entry-node log**
+  (`tools/pr46-replay/bench.js`), with a 512 MB heap cap:
+
+  | Run | Lines per second | Heap |
+  |---|---:|---|
+  | patched only, 512 MB cap | 55,022 | finished at 320 MB, before GC |
+  | PR head only, 512 MB cap | 72,302 | finished at 389 MB, before GC |
+  | both (`--compare`), 512 MB cap | out of memory after about 5 minutes | the two states together need more than 512 MB |
+
+  After-GC heap samples every 1 M lines, and a `--compare` run with a 1 GB
+  cap, are still running and will be added here.
+
+  **The PR head's state is bounded but large.** It keeps one detector key
+  per (port, /24) per user, up to `maxKeysPerUser` (256), and stale keys
+  leave only through the LRU. On this log, 4,000 users grew it to about
+  390 MB; the worst case is `maxTrackedUsers x maxKeysPerUser` keys. The
+  patched rules keep keys for recon ports only.
+
+**The real-data comparison is pending with the operator**, using the exact
+command and success criteria in `tools/pr46-replay/README.md`.
+
 ## Not verified
 
 - **Real traffic, beyond one day.** Apart from the one-day replay above, all
@@ -420,10 +590,17 @@ These are minimal and ordered by how much risk they remove.
   BitTorrent over TCP. With nobody doing so, there was no block in 30 minutes;
   60 minutes and 4,000 people were also checked ad hoc. No exit node and no
   CGNAT case was observed in real data.
-- **Access log vs webhook.** The access log has no
-  `originalTarget`/`routeTarget` and no sniffed protocol. Lines with a domain
-  destination are therefore not scored, rules that already had a webhook are
-  not modelled, and Torrent Blocker's `bittorrent` rule is assumed off.
+- **Access log vs webhook.**
+  - Now established from source (DETECTION-FACTS.md §2): the access log's
+    destination is exactly the webhook's `originalTarget`, so the domain
+    share the harness reports is the PR's own blind spot.
+  - Still not modelled: a domain added by `routeOnly` sniffing when the
+    client connected by IP (the PR uses the IP in that case anyway), rules
+    that already had a webhook, and Torrent Blocker's `bittorrent` rule
+    (assumed off).
+- **The proposed detector changes** were tested on synthetic data only. N
+  (50) and M (100) for the hostname rules were chosen on synthetic cases.
+  The real-data comparison is pending with the operator.
 - **nftables and kernel behaviour.** This includes timeout refresh on re-add
   and the actual connection drop. The panel side (report collection,
   `refresh-block` escalation) and the cost of one webhook per TCP connection
@@ -439,4 +616,15 @@ node --test 'tools/pr46-replay/test/*.test.js'   # 34 tests, ~10 s
 node tools/pr46-replay/run-scenarios.js          # the Results table
 node tools/pr46-replay/sensitivity.js            # the sensitivity table
 node tools/pr46-replay/run.js --log access.log --out report.json   # any real log, offline
+```
+
+For the proposed detector changes:
+
+```sh
+git checkout review/pr46-detection && npm ci
+node --test tools/pr46-replay/test/all.test.js                     # everything, including the PR's own tests
+node tools/pr46-replay/run-scenarios.js                            # the before/after table
+node tools/pr46-replay/sensitivity.js                              # sweeps, head vs patched
+node tools/pr46-replay/sensitivity-domains.js                      # N and M for the hostname rules
+node tools/pr46-replay/run.js --log access.log* --out report.json --compare   # real logs, offline
 ```
