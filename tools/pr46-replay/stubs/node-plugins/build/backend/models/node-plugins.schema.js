@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NodePluginEditorSchema = exports.NodePluginSchema = exports.preStartPluginSchema = exports.EgressFilterPluginSchema = exports.IngressFilterPluginSchema = exports.ConnectionDropPluginSchema = exports.AbuseBlockerPluginSchema = exports.TorrentBlockerPluginSchema = exports.SharedListSchema = exports.SharedListConfigSchema = void 0;
+exports.NodePluginEditorSchema = exports.NodePluginSchema = exports.preStartPluginSchema = exports.EgressFilterPluginSchema = exports.IngressFilterPluginSchema = exports.ConnectionDropPluginSchema = exports.AbuseBlockerPluginSchema = exports.ABUSE_BLOCKER_RECON_PORTS = exports.TorrentBlockerPluginSchema = exports.SharedListSchema = exports.SharedListConfigSchema = void 0;
 const zod_1 = require("zod");
 const DOCS_LINK = `\n\n[📖 Documentation](https://docs.rw/docs/learn/node-plugins)`;
 // https://github.com/colinhacks/zod/issues/5944
@@ -177,6 +177,113 @@ const DestinationSweepRuleSchema = zod_1.z
     title: 'Destination Sweep',
     markdownDescription: abuseBlockerDocs('Detects one user contacting many unique destination IPs on the same non-web port.'),
 });
+/** CONTEXT: ports whose scans generate hoster abuse tickets. */
+exports.ABUSE_BLOCKER_RECON_PORTS = [
+    21, 22, 23, 88, 111, 135, 137, 139, 179, 389, 445, 502, 512, 513, 514, 515, 523, 548, 553, 554,
+    623, 636, 873, 1099, 1433, 1521, 1723, 2049, 2222, 2323, 2375, 2376, 2379, 2380, 3306, 3389,
+    4444, 4786, 5432, 5555, 5900, 5901, 5902, 5984, 5985, 5986, 6379, 6443, 7547, 8291, 9200, 9300,
+    11211, 27017, 27018, 47808,
+];
+const HorizontalSweepRuleSchema = zod_1.z
+    .object({
+    enabled: zod_1.z.boolean().default(true),
+    windowSeconds: zod_1.z.int().min(60).max(3600).default(900),
+    uniqueNetworks: zod_1.z.int().min(2).max(4096).default(150),
+    ipv4Prefix: zod_1.z.int().min(8).max(32).default(24),
+    ipv6Prefix: zod_1.z.int().min(16).max(128).default(48),
+    maxNetworksPerKey: zod_1.z.int().min(2).max(4096).default(256),
+    score: zod_1.z.int().min(1).max(10000).default(100),
+    blockEligible: zod_1.z.boolean().default(true),
+})
+    .refine((rule) => rule.maxNetworksPerKey >= rule.uniqueNetworks, {
+    message: 'maxNetworksPerKey must be at least uniqueNetworks.',
+    path: ['maxNetworksPerKey'],
+})
+    .prefault({})
+    .meta({
+    title: 'Horizontal Sweep',
+    markdownDescription: abuseBlockerDocs('Distinct destination networks (IPv4 /24, IPv6 /48) per user and scan port over the window.'),
+});
+const HammerTargetRuleSchema = zod_1.z
+    .object({
+    enabled: zod_1.z.boolean().default(true),
+    windowSeconds: zod_1.z.int().min(60).max(3600).default(900),
+    sessions: zod_1.z.int().min(2).max(65535).default(300),
+    maxTargetsPerUser: zod_1.z.int().min(1).max(4096).default(64),
+    score: zod_1.z.int().min(1).max(10000).default(100),
+    blockEligible: zod_1.z.boolean().default(true),
+})
+    .prefault({})
+    .meta({
+    title: 'Hammer Target',
+    markdownDescription: abuseBlockerDocs('Sessions per user to one destination (IP or hostname) and scan port over the window.'),
+});
+const SessionRateBurstRuleSchema = zod_1.z
+    .object({
+    enabled: zod_1.z.boolean().default(true),
+    windowSeconds: zod_1.z.int().min(5).max(3600).default(60),
+    sessions: zod_1.z.int().min(2).max(1000000).default(600),
+    score: zod_1.z.int().min(1).max(10000).default(100),
+    blockEligible: zod_1.z.boolean().default(false),
+})
+    .prefault({})
+    .meta({
+    title: 'Session Rate Burst',
+    markdownDescription: abuseBlockerDocs('Sessions per user on any port outside excludedPorts over the window. Report-only by default.'),
+});
+const DomainRulesSchema = zod_1.z
+    .object({
+    enabled: zod_1.z.boolean().default(true),
+    sweep: zod_1.z
+        .object({
+        enabled: zod_1.z.boolean().default(true),
+        windowSeconds: zod_1.z.int().min(60).max(3600).default(900),
+        uniqueDomains: zod_1.z.int().min(2).max(4096).default(50),
+        maxDomainsPerKey: zod_1.z.int().min(2).max(4096).default(256),
+        score: zod_1.z.int().min(1).max(10000).default(100),
+        blockEligible: zod_1.z.boolean().default(true),
+    })
+        .refine((rule) => rule.maxDomainsPerKey >= rule.uniqueDomains, {
+        message: 'maxDomainsPerKey must be at least uniqueDomains.',
+        path: ['maxDomainsPerKey'],
+    })
+        .prefault({}),
+    subdomainSweep: zod_1.z
+        .object({
+        enabled: zod_1.z.boolean().default(true),
+        windowSeconds: zod_1.z.int().min(60).max(3600).default(900),
+        uniqueHosts: zod_1.z.int().min(2).max(4096).default(100),
+        maxHostsPerKey: zod_1.z.int().min(2).max(4096).default(256),
+        maxDomainsPerUser: zod_1.z.int().min(1).max(4096).default(32),
+        score: zod_1.z.int().min(1).max(10000).default(100),
+        blockEligible: zod_1.z.boolean().default(false),
+    })
+        .refine((rule) => rule.maxHostsPerKey >= rule.uniqueHosts, {
+        message: 'maxHostsPerKey must be at least uniqueHosts.',
+        path: ['maxHostsPerKey'],
+    })
+        .prefault({}),
+})
+    .prefault({})
+    .meta({
+    title: 'Domain Destinations',
+    markdownDescription: abuseBlockerDocs('Scores requests by hostname on scan ports: per-hostname hammer, distinct registrable domains, and distinct hostnames under one domain. Never resolves DNS.'),
+});
+const AbuseBlockerSourceGuardsSchema = zod_1.z
+    .object({
+    enabled: zod_1.z.boolean().default(true),
+    blockNonPublicSources: zod_1.z.boolean().default(false),
+    maxUsersPerSource: zod_1.z.int().min(1).max(16).default(1),
+    userWindowSeconds: zod_1.z.int().min(60).max(86400).default(3600),
+    maxTrackedSources: zod_1.z.int().min(1).max(1000000).default(100000),
+    reportOnlyUserIds: zod_1.z.array(zod_1.z.int().min(1)).default([]),
+    reportOnlyInboundTags: zod_1.z.array(zod_1.z.string().min(1)).default([]),
+})
+    .prefault({})
+    .meta({
+    title: 'Source Guards',
+    markdownDescription: abuseBlockerDocs('Turns a block into a report for non-public sources, listed users or inbounds, and sources shared by more than maxUsersPerSource users.'),
+});
 exports.AbuseBlockerPluginSchema = zod_1.z
     .object({
     enabled: zod_1.z.boolean().meta({
@@ -209,6 +316,37 @@ exports.AbuseBlockerPluginSchema = zod_1.z
     reportBufferSize: zod_1.z.int().min(1).max(1000000).default(10000),
     horizontalScan: HorizontalScanRuleSchema,
     destinationSweep: DestinationSweepRuleSchema,
+    mode: zod_1.z
+        .enum(['report', 'block'])
+        .default('report')
+        .meta({
+        title: 'Mode',
+        markdownDescription: abuseBlockerDocs('report: decisions are reported only. block: source IPs of confirmed incidents are blocked.'),
+    }),
+    ruleSet: zod_1.z
+        .enum(['v2', 'legacy', 'both'])
+        .default('v2')
+        .meta({
+        title: 'Rule Set',
+        markdownDescription: abuseBlockerDocs('v2: horizontalSweep, hammerTarget, sessionRateBurst and domain rules. legacy: horizontalScan and destinationSweep. both: all of them.'),
+    }),
+    scanPorts: zod_1.z
+        .array(zod_1.z.int().min(1).max(65535))
+        .refine((ports) => new Set(ports).size === ports.length, {
+        message: 'Scan ports must be unique.',
+    })
+        .default(exports.ABUSE_BLOCKER_RECON_PORTS)
+        .meta({
+        title: 'Scan Ports',
+        markdownDescription: abuseBlockerDocs('Only these destination ports feed scan and hammer rules. Empty: every port not in excludedPorts.'),
+    }),
+    confirmationSeconds: zod_1.z.int().min(0).max(3600).default(60),
+    rearmAfterCooldown: zod_1.z.boolean().default(true),
+    horizontalSweep: HorizontalSweepRuleSchema,
+    hammerTarget: HammerTargetRuleSchema,
+    sessionRateBurst: SessionRateBurstRuleSchema,
+    domains: DomainRulesSchema,
+    sourceGuards: AbuseBlockerSourceGuardsSchema,
 })
     .refine((config) => config.suspiciousScore < config.alertScore, {
     message: 'suspiciousScore must be lower than alertScore.',

@@ -25,6 +25,8 @@ export declare const TorrentBlockerPluginSchema: z.ZodObject<{
     includeRuleTags: z.ZodOptional<z.ZodArray<z.ZodString>>;
     webhookUrl: z.ZodOptional<z.ZodURL>;
 }, z.core.$strip>;
+/** CONTEXT: ports whose scans generate hoster abuse tickets. */
+export declare const ABUSE_BLOCKER_RECON_PORTS: number[];
 export declare const AbuseBlockerPluginSchema: z.ZodObject<{
     enabled: z.ZodBoolean;
     excludedPorts: z.ZodDefault<z.ZodArray<z.ZodInt>>;
@@ -59,6 +61,72 @@ export declare const AbuseBlockerPluginSchema: z.ZodObject<{
         windowSeconds: z.ZodDefault<z.ZodInt>;
         uniqueDestinations: z.ZodDefault<z.ZodInt>;
         score: z.ZodDefault<z.ZodInt>;
+    }, z.core.$strip>>;
+    mode: z.ZodDefault<z.ZodEnum<{
+        report: "report";
+        block: "block";
+    }>>;
+    ruleSet: z.ZodDefault<z.ZodEnum<{
+        v2: "v2";
+        legacy: "legacy";
+        both: "both";
+    }>>;
+    scanPorts: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+    confirmationSeconds: z.ZodDefault<z.ZodInt>;
+    rearmAfterCooldown: z.ZodDefault<z.ZodBoolean>;
+    horizontalSweep: z.ZodPrefault<z.ZodObject<{
+        enabled: z.ZodDefault<z.ZodBoolean>;
+        windowSeconds: z.ZodDefault<z.ZodInt>;
+        uniqueNetworks: z.ZodDefault<z.ZodInt>;
+        ipv4Prefix: z.ZodDefault<z.ZodInt>;
+        ipv6Prefix: z.ZodDefault<z.ZodInt>;
+        maxNetworksPerKey: z.ZodDefault<z.ZodInt>;
+        score: z.ZodDefault<z.ZodInt>;
+        blockEligible: z.ZodDefault<z.ZodBoolean>;
+    }, z.core.$strip>>;
+    hammerTarget: z.ZodPrefault<z.ZodObject<{
+        enabled: z.ZodDefault<z.ZodBoolean>;
+        windowSeconds: z.ZodDefault<z.ZodInt>;
+        sessions: z.ZodDefault<z.ZodInt>;
+        maxTargetsPerUser: z.ZodDefault<z.ZodInt>;
+        score: z.ZodDefault<z.ZodInt>;
+        blockEligible: z.ZodDefault<z.ZodBoolean>;
+    }, z.core.$strip>>;
+    sessionRateBurst: z.ZodPrefault<z.ZodObject<{
+        enabled: z.ZodDefault<z.ZodBoolean>;
+        windowSeconds: z.ZodDefault<z.ZodInt>;
+        sessions: z.ZodDefault<z.ZodInt>;
+        score: z.ZodDefault<z.ZodInt>;
+        blockEligible: z.ZodDefault<z.ZodBoolean>;
+    }, z.core.$strip>>;
+    domains: z.ZodPrefault<z.ZodObject<{
+        enabled: z.ZodDefault<z.ZodBoolean>;
+        sweep: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            uniqueDomains: z.ZodDefault<z.ZodInt>;
+            maxDomainsPerKey: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        subdomainSweep: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            uniqueHosts: z.ZodDefault<z.ZodInt>;
+            maxHostsPerKey: z.ZodDefault<z.ZodInt>;
+            maxDomainsPerUser: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+    }, z.core.$strip>>;
+    sourceGuards: z.ZodPrefault<z.ZodObject<{
+        enabled: z.ZodDefault<z.ZodBoolean>;
+        blockNonPublicSources: z.ZodDefault<z.ZodBoolean>;
+        maxUsersPerSource: z.ZodDefault<z.ZodInt>;
+        userWindowSeconds: z.ZodDefault<z.ZodInt>;
+        maxTrackedSources: z.ZodDefault<z.ZodInt>;
+        reportOnlyUserIds: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+        reportOnlyInboundTags: z.ZodDefault<z.ZodArray<z.ZodString>>;
     }, z.core.$strip>>;
 }, z.core.$strip>;
 export declare const ConnectionDropPluginSchema: z.ZodObject<{
@@ -136,6 +204,72 @@ export declare const NodePluginSchema: z.ZodObject<{
             uniqueDestinations: z.ZodDefault<z.ZodInt>;
             score: z.ZodDefault<z.ZodInt>;
         }, z.core.$strip>>;
+        mode: z.ZodDefault<z.ZodEnum<{
+            report: "report";
+            block: "block";
+        }>>;
+        ruleSet: z.ZodDefault<z.ZodEnum<{
+            v2: "v2";
+            legacy: "legacy";
+            both: "both";
+        }>>;
+        scanPorts: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+        confirmationSeconds: z.ZodDefault<z.ZodInt>;
+        rearmAfterCooldown: z.ZodDefault<z.ZodBoolean>;
+        horizontalSweep: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            uniqueNetworks: z.ZodDefault<z.ZodInt>;
+            ipv4Prefix: z.ZodDefault<z.ZodInt>;
+            ipv6Prefix: z.ZodDefault<z.ZodInt>;
+            maxNetworksPerKey: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        hammerTarget: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            sessions: z.ZodDefault<z.ZodInt>;
+            maxTargetsPerUser: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        sessionRateBurst: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            sessions: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        domains: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            sweep: z.ZodPrefault<z.ZodObject<{
+                enabled: z.ZodDefault<z.ZodBoolean>;
+                windowSeconds: z.ZodDefault<z.ZodInt>;
+                uniqueDomains: z.ZodDefault<z.ZodInt>;
+                maxDomainsPerKey: z.ZodDefault<z.ZodInt>;
+                score: z.ZodDefault<z.ZodInt>;
+                blockEligible: z.ZodDefault<z.ZodBoolean>;
+            }, z.core.$strip>>;
+            subdomainSweep: z.ZodPrefault<z.ZodObject<{
+                enabled: z.ZodDefault<z.ZodBoolean>;
+                windowSeconds: z.ZodDefault<z.ZodInt>;
+                uniqueHosts: z.ZodDefault<z.ZodInt>;
+                maxHostsPerKey: z.ZodDefault<z.ZodInt>;
+                maxDomainsPerUser: z.ZodDefault<z.ZodInt>;
+                score: z.ZodDefault<z.ZodInt>;
+                blockEligible: z.ZodDefault<z.ZodBoolean>;
+            }, z.core.$strip>>;
+        }, z.core.$strip>>;
+        sourceGuards: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            blockNonPublicSources: z.ZodDefault<z.ZodBoolean>;
+            maxUsersPerSource: z.ZodDefault<z.ZodInt>;
+            userWindowSeconds: z.ZodDefault<z.ZodInt>;
+            maxTrackedSources: z.ZodDefault<z.ZodInt>;
+            reportOnlyUserIds: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+            reportOnlyInboundTags: z.ZodDefault<z.ZodArray<z.ZodString>>;
+        }, z.core.$strip>>;
     }, z.core.$strip>>;
     ingressFilter: z.ZodOptional<z.ZodObject<{
         enabled: z.ZodBoolean;
@@ -203,6 +337,72 @@ export declare const NodePluginEditorSchema: z.ZodObject<{
             windowSeconds: z.ZodDefault<z.ZodInt>;
             uniqueDestinations: z.ZodDefault<z.ZodInt>;
             score: z.ZodDefault<z.ZodInt>;
+        }, z.core.$strip>>;
+        mode: z.ZodDefault<z.ZodEnum<{
+            report: "report";
+            block: "block";
+        }>>;
+        ruleSet: z.ZodDefault<z.ZodEnum<{
+            v2: "v2";
+            legacy: "legacy";
+            both: "both";
+        }>>;
+        scanPorts: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+        confirmationSeconds: z.ZodDefault<z.ZodInt>;
+        rearmAfterCooldown: z.ZodDefault<z.ZodBoolean>;
+        horizontalSweep: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            uniqueNetworks: z.ZodDefault<z.ZodInt>;
+            ipv4Prefix: z.ZodDefault<z.ZodInt>;
+            ipv6Prefix: z.ZodDefault<z.ZodInt>;
+            maxNetworksPerKey: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        hammerTarget: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            sessions: z.ZodDefault<z.ZodInt>;
+            maxTargetsPerUser: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        sessionRateBurst: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            windowSeconds: z.ZodDefault<z.ZodInt>;
+            sessions: z.ZodDefault<z.ZodInt>;
+            score: z.ZodDefault<z.ZodInt>;
+            blockEligible: z.ZodDefault<z.ZodBoolean>;
+        }, z.core.$strip>>;
+        domains: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            sweep: z.ZodPrefault<z.ZodObject<{
+                enabled: z.ZodDefault<z.ZodBoolean>;
+                windowSeconds: z.ZodDefault<z.ZodInt>;
+                uniqueDomains: z.ZodDefault<z.ZodInt>;
+                maxDomainsPerKey: z.ZodDefault<z.ZodInt>;
+                score: z.ZodDefault<z.ZodInt>;
+                blockEligible: z.ZodDefault<z.ZodBoolean>;
+            }, z.core.$strip>>;
+            subdomainSweep: z.ZodPrefault<z.ZodObject<{
+                enabled: z.ZodDefault<z.ZodBoolean>;
+                windowSeconds: z.ZodDefault<z.ZodInt>;
+                uniqueHosts: z.ZodDefault<z.ZodInt>;
+                maxHostsPerKey: z.ZodDefault<z.ZodInt>;
+                maxDomainsPerUser: z.ZodDefault<z.ZodInt>;
+                score: z.ZodDefault<z.ZodInt>;
+                blockEligible: z.ZodDefault<z.ZodBoolean>;
+            }, z.core.$strip>>;
+        }, z.core.$strip>>;
+        sourceGuards: z.ZodPrefault<z.ZodObject<{
+            enabled: z.ZodDefault<z.ZodBoolean>;
+            blockNonPublicSources: z.ZodDefault<z.ZodBoolean>;
+            maxUsersPerSource: z.ZodDefault<z.ZodInt>;
+            userWindowSeconds: z.ZodDefault<z.ZodInt>;
+            maxTrackedSources: z.ZodDefault<z.ZodInt>;
+            reportOnlyUserIds: z.ZodDefault<z.ZodArray<z.ZodInt>>;
+            reportOnlyInboundTags: z.ZodDefault<z.ZodArray<z.ZodString>>;
         }, z.core.$strip>>;
     }, z.core.$strip>>;
     ingressFilter: z.ZodOptional<z.ZodObject<{
