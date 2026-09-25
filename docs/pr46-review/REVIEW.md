@@ -29,12 +29,15 @@ infrastructure. How the blocker works is summarized in
   defaults. TCP BitTorrent still reaches `alert`. Exempting the ports the
   operator exempts (possible with the existing `excludedPorts` field) removes
   that alert and the chain-node block.
-- **On one day of real traffic from four entry nodes, the defaults were
-  quiet but nearly blind.** There was one false block (a BitTorrent user on
-  :6881) in four node-days. A real SSH sweep that the operator's detector
-  flagged reached only `suspicious` (score 50). Only about 4.5% of log lines
-  were scored at all, because about 70% of TCP sessions target a domain rather
-  than an IP.
+- **About a month of real traffic from 17 entry nodes** (plus 55 exit nodes,
+  4.8 billion log lines in total) shows three problems:
+  - The blocker fired 0.83 times per node-day. 86% of those blocks were on
+    non-recon ports (BitTorrent and app ports).
+  - It blocked 27% of the confirmed horizontal sweeps, and none of the 43
+    single-target hammers.
+  - Only about 4.5% of lines are scored at all.
+
+  As expected, on chained exit nodes it blocks the entry node's address.
 - The PR does not build yet: no published `@remnawave/node-plugins` release
   contains the `abuseBlocker` schema.
 
@@ -261,8 +264,94 @@ What this shows:
   less for recon than the number suggests. It still means the blocker sees a
   small slice of the traffic.
 
-One day on four nodes is a small sample. It says little about how often
-shared addresses would be blocked across a whole fleet or over a month.
+One day on four nodes is a small sample. The full replay below extends it to
+the whole fleet and all retained logs.
+
+## Real traffic: all retained logs, whole fleet
+
+Same harness (`ed65fff`), schema defaults, same isolation and data handling
+as above. There were two differences:
+- The logs were mounted read-only in place, with no copies.
+- Every node with retained raw logs was included: 55 exit nodes and 17 entry
+  nodes. A few entry nodes have since been retired. Coverage runs from late
+  August to late September 2026, about a month.
+
+Only aggregates left the host. The per-decision files were deleted.
+
+| | Exit nodes | Entry nodes |
+|---|---:|---:|
+| Nodes | 55 | 17 |
+| Node-days | 1,340 | 353 |
+| Log lines | 2.01 B | 2.76 B |
+| TCP sessions with a domain destination | 81% | 68% |
+| Lines scored by PR #46 | 88 M (4.4%) | 132 M (4.8%) |
+| Blocks | 154 on 33 nodes | 294 (33 distinct users) |
+| Blocks per node-day | 0.115 | 0.83 |
+| Sessions dropped while blocked | 2.18 M | 275 k |
+
+On chained exit nodes the result is as expected: all 154 blocks hit an entry
+node's internal mesh address. Suggestion 2 below covers this; the rest of
+this section is about entry nodes.
+
+### Entry nodes: frequent, mostly non-scan blocks
+
+- **By severity:** 436 `suspicious`, 197 `alert` and 294 `blocked`.
+- **Blocks by traffic class:**
+  - other (unassigned) ports 173 (59%);
+  - BitTorrent 59;
+  - recon ports 40 (14%);
+  - game/realtime 13;
+  - DNS 8;
+  - alt-proxy 1.
+- **The top blocked ports were app traffic, not scans:**
+
+  | Port | Blocks | Users |
+  |---|---:|---:|
+  | 50300 | 85 | 2 |
+  | 6881 | 51 | 5 |
+  | 8887 | 19 | 1 |
+  | 53317 | 16 | 7 |
+  | 22 | 13 | 4 |
+  | 62078 (Apple device sync) | 12 | 1 |
+  | 554 | 11 | 4 |
+
+  A few users are blocked again and again for their normal app traffic.
+- **Shared addresses.** Blocked source IPs carried one user in most cases.
+  In 12 per-day reports, a blocked IP carried 2-5 users, and 2 bystanders
+  lost sessions. CGNAT collateral exists but was small here. This fleet's
+  users mostly connect from distinct addresses.
+
+### Recall against the operator's confirmed incidents
+
+- **What was matched.** Actionable incidents from the operator's detector
+  inside the replay's time coverage were matched to PR #46 decisions on the
+  same entry node, within ±1 h, on the same port. For `session_rate_burst`,
+  any port counts.
+- **Match on node and time only.** Users cannot be matched, because the
+  operator's history stores only keyed user hashes. The figures are
+  therefore an **upper bound** on recall.
+
+| Operator incident | In coverage | PR #46 blocked | alert | suspicious | nothing |
+|---|---:|---:|---:|---:|---:|
+| `horizontal_sweep_hard` (>= 150 /24s on a recon port) | 55 | 15 (27%) | 9 | 12 | 19 (35%) |
+| `hammer_target` (>= 300 sessions to one host:port) | 43 | 0 | 0 | 3 | 40 (93%) |
+| `session_rate_burst` (>= 600 non-web sessions/min) | 116 | 13 (11%) | 8 | 8 | 87 (75%) |
+
+This matches the synthetic findings:
+- sweeps are caught only partly, because of the latching key;
+- single-target hammers and rate bursts are outside what the rules measure.
+
+### Caveats of the full run
+
+- **Day boundaries.** For 14 entry nodes, a whole-period replay ran out of
+  V8 heap, so they were replayed one UTC day at a time. Scoring state does
+  not carry across midnight, so a scan that spans midnight is scored in two
+  halves.
+- **Log rotation.** Exit nodes were replayed one whole period per node, and
+  the host rotates logs hourly by renaming. A rotation during a run can skip
+  or shift up to one hour out of about 650 for that node. Entry nodes were
+  replayed from a frozen hardlink snapshot and are not affected.
+- **Domain destinations** are not scored. See "Access log vs webhook" below.
 
 ## Suggestions
 
