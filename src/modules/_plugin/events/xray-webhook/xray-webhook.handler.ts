@@ -14,30 +14,55 @@ import {
 
 import { NftService } from '../../services/nft.service';
 import { PluginStateService } from '../../services/plugin-state.service';
+import { parseDomainEndpoint } from '../../utils/domain.utils';
 import { parseNetworkEndpoint } from '../../utils/ip-address.utils';
 import { XrayWebhookEvent } from './xray-webhook.event';
 
 const WEBHOOK_TIMEOUT_MS = 5_000;
 
+/**
+ * Maps a routing webhook to an observation. An IP target is always preferred.
+ * With `domains`, a request by hostname becomes a hostname observation instead of
+ * being dropped (Xray never puts a resolved IP into the webhook).
+ */
 export const toAbuseBlockerObservation = (
     webhook: XrayWebhookModel,
+    options: { domains?: boolean } = {},
 ): IAbuseBlockerObservation | null => {
     if (webhook.network.toLowerCase() !== 'tcp') return null;
     if (!webhook.email || !/^\d+$/.test(webhook.email)) return null;
 
     const source = parseNetworkEndpoint(webhook.source);
-    const destination = [webhook.originalTarget, webhook.routeTarget, webhook.destination]
+    const targets = [webhook.originalTarget, webhook.routeTarget, webhook.destination];
+    const destination = targets
         .map(parseNetworkEndpoint)
         .find((candidate) => candidate?.port && candidate.port >= 1 && candidate.port <= 65535);
-    if (!source || !destination?.port) return null;
+    if (!source) return null;
 
-    return {
+    const observation = {
         userId: webhook.email,
         sourceIp: source.ip,
-        destinationIp: destination.ip,
-        destinationPort: destination.port,
+        inboundTag: webhook.inboundTag,
         timestamp: Number.isFinite(webhook.ts) ? webhook.ts * 1000 : Date.now(),
         xrayReport: webhook,
+    };
+    if (destination?.port) {
+        return {
+            ...observation,
+            destinationIp: destination.ip,
+            destinationHost: null,
+            destinationPort: destination.port,
+        };
+    }
+    if (!options.domains) return null;
+
+    const domain = targets.map(parseDomainEndpoint).find(Boolean);
+    if (!domain) return null;
+    return {
+        ...observation,
+        destinationIp: null,
+        destinationHost: domain.host,
+        destinationPort: domain.port,
     };
 };
 
@@ -111,7 +136,7 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
         const state = this.pluginState.abuseBlocker;
         if (!state.isEnabled) return;
 
-        const observation = toAbuseBlockerObservation(webhook);
+        const observation = toAbuseBlockerObservation(webhook, { domains: state.acceptsDomains });
         if (!observation) return;
 
         const analysis = state.analyze(observation);
@@ -120,9 +145,12 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
         const policy = state.policy;
         if (!policy) return;
 
+        const shouldBlock = analysis.shouldBlock && policy.mode === 'block';
+        const skipReason =
+            analysis.skipReason ?? (analysis.shouldBlock && !shouldBlock ? 'report_only' : null);
         let blocked = false;
         let blockError: string | null = null;
-        if (analysis.shouldBlock) {
+        if (shouldBlock) {
             try {
                 await this.nftService.blockAbuseIp(
                     observation.sourceIp,
@@ -140,7 +168,10 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
             eventId: randomUUID(),
             userId: observation.userId,
             sourceIp: observation.sourceIp,
+            sourceIpUserCount: analysis.sourceIpUserCount,
+            inboundTag: observation.inboundTag ?? null,
             destinationIp: observation.destinationIp,
+            destinationHost: observation.destinationHost ?? null,
             destinationPort: observation.destinationPort,
             detectedAt: new Date(observation.timestamp),
             detections: analysis.detections,
@@ -153,14 +184,15 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
             severity: analysis.severity,
             evidence: analysis.evidence,
             actionReport: {
-                action: analysis.shouldBlock ? 'ip_block' : 'none',
+                action: shouldBlock ? 'ip_block' : 'none',
                 blocked,
-                blockDuration: analysis.shouldBlock ? policy.initialBlockSeconds : 0,
+                blockDuration: shouldBlock ? policy.initialBlockSeconds : 0,
                 willUnblockAt:
-                    analysis.shouldBlock && blocked
+                    shouldBlock && blocked
                         ? new Date(processedAt.getTime() + policy.initialBlockSeconds * 1000)
                         : null,
                 error: blockError,
+                skipReason,
                 processedAt,
             },
             policy,
@@ -171,7 +203,7 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
 
         state.addReport(report);
         this.logger.log(
-            `[ABUSE-BLOCKER] user=${observation.userId}, source=${observation.sourceIp}, score=${analysis.scoreAfter}, severity=${analysis.severity}, blocked=${blocked}`,
+            `[ABUSE-BLOCKER] user=${observation.userId}, source=${observation.sourceIp}, score=${analysis.scoreAfter}, severity=${analysis.severity}, blocked=${blocked}${skipReason ? `, skip=${skipReason}` : ''}`,
         );
     }
 
