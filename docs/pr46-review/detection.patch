@@ -1,0 +1,1567 @@
+diff --git a/libs/contract/models/abuse-blocker.report.schema.ts b/libs/contract/models/abuse-blocker.report.schema.ts
+index 32e2dc9..6c11590 100644
+--- a/libs/contract/models/abuse-blocker.report.schema.ts
++++ b/libs/contract/models/abuse-blocker.report.schema.ts
+@@ -2,9 +2,32 @@ import { z } from 'zod';
+ 
+ import { XrayWebhookSchema } from './xray-webhook.schema';
+ 
+-export const AbuseBlockerRuleNameSchema = z.enum(['horizontal_scan', 'destination_sweep']);
++export const AbuseBlockerRuleNameSchema = z.enum([
++    'horizontal_scan',
++    'destination_sweep',
++    'horizontal_sweep',
++    'hammer_target',
++    'session_rate_burst',
++    'horizontal_sweep_domains',
++    'subdomain_sweep',
++]);
+ export const AbuseBlockerSeveritySchema = z.enum(['suspicious', 'alert', 'blocked']);
+ export const AbuseBlockerCoverageModeSchema = z.enum(['full', 'partial']);
++export const AbuseBlockerDetectionPhaseSchema = z.enum(['single', 'candidate', 'confirmed']);
++export const AbuseBlockerSkipReasonSchema = z.enum([
++    'report_only',
++    'non_public_source',
++    'report_only_user',
++    'report_only_inbound',
++    'shared_source',
++]);
++
++const AbuseBlockerRulePolicySchema = z.object({
++    enabled: z.boolean(),
++    windowSeconds: z.int().min(1),
++    score: z.int().min(1),
++    blockEligible: z.boolean(),
++});
+ 
+ export const AbuseBlockerPolicySchema = z.object({
+     excludedPorts: z.array(z.int().min(1).max(65535)),
+@@ -35,13 +58,55 @@ export const AbuseBlockerPolicySchema = z.object({
+         uniqueDestinations: z.int().min(2),
+         score: z.int().min(1),
+     }),
++    mode: z.enum(['report', 'block']),
++    ruleSet: z.enum(['v2', 'legacy', 'both']),
++    scanPorts: z.array(z.int().min(1).max(65535)),
++    confirmationSeconds: z.int().min(0),
++    rearmAfterCooldown: z.boolean(),
++    horizontalSweep: AbuseBlockerRulePolicySchema.extend({
++        uniqueNetworks: z.int().min(2),
++        ipv4Prefix: z.int().min(0).max(32),
++        ipv6Prefix: z.int().min(0).max(128),
++        maxNetworksPerKey: z.int().min(2),
++    }),
++    hammerTarget: AbuseBlockerRulePolicySchema.extend({
++        sessions: z.int().min(2),
++        maxTargetsPerUser: z.int().min(1),
++    }),
++    sessionRateBurst: AbuseBlockerRulePolicySchema.extend({
++        sessions: z.int().min(2),
++    }),
++    domains: z.object({
++        enabled: z.boolean(),
++        sweep: AbuseBlockerRulePolicySchema.extend({
++            uniqueDomains: z.int().min(2),
++            maxDomainsPerKey: z.int().min(2),
++        }),
++        subdomainSweep: AbuseBlockerRulePolicySchema.extend({
++            uniqueHosts: z.int().min(2),
++            maxHostsPerKey: z.int().min(2),
++            maxDomainsPerUser: z.int().min(1),
++        }),
++    }),
++    sourceGuards: z.object({
++        enabled: z.boolean(),
++        blockNonPublicSources: z.boolean(),
++        maxUsersPerSource: z.int().min(1),
++        userWindowSeconds: z.int().min(1),
++        maxTrackedSources: z.int().min(1),
++        reportOnlyUserIds: z.array(z.int().min(1)),
++        reportOnlyInboundTags: z.array(z.string()),
++    }),
+ });
+ 
+ export const AbuseBlockerReportSchema = z.object({
+     eventId: z.uuid(),
+     userId: z.string().regex(/^\d+$/),
+     sourceIp: z.union([z.ipv4(), z.ipv6()]),
+-    destinationIp: z.union([z.ipv4(), z.ipv6()]),
++    sourceIpUserCount: z.int().min(0),
++    inboundTag: z.string().nullable(),
++    destinationIp: z.union([z.ipv4(), z.ipv6()]).nullable(),
++    destinationHost: z.string().nullable(),
+     destinationPort: z.int().min(1).max(65535),
+     detectedAt: z.coerce.date(),
+     detections: z.array(
+@@ -52,6 +117,9 @@ export const AbuseBlockerReportSchema = z.object({
+             windowSeconds: z.int().min(1),
+             score: z.int().min(1),
+             subnet: z.string().nullable(),
++            phase: AbuseBlockerDetectionPhaseSchema,
++            count: z.int().min(1),
++            unit: z.enum(['destinations', 'networks', 'sessions', 'domains', 'hostnames']),
+         }),
+     ),
+     score: z.object({
+@@ -74,6 +142,7 @@ export const AbuseBlockerReportSchema = z.object({
+         blockDuration: z.int().min(0),
+         willUnblockAt: z.coerce.date().nullable(),
+         error: z.string().nullable(),
++        skipReason: AbuseBlockerSkipReasonSchema.nullable(),
+         processedAt: z.coerce.date(),
+     }),
+     policy: AbuseBlockerPolicySchema,
+@@ -85,5 +154,7 @@ export const AbuseBlockerReportSchema = z.object({
+ export type AbuseBlockerRuleName = z.infer<typeof AbuseBlockerRuleNameSchema>;
+ export type AbuseBlockerSeverity = z.infer<typeof AbuseBlockerSeveritySchema>;
+ export type AbuseBlockerCoverageMode = z.infer<typeof AbuseBlockerCoverageModeSchema>;
++export type AbuseBlockerDetectionPhase = z.infer<typeof AbuseBlockerDetectionPhaseSchema>;
++export type AbuseBlockerSkipReason = z.infer<typeof AbuseBlockerSkipReasonSchema>;
+ export type AbuseBlockerPolicy = z.infer<typeof AbuseBlockerPolicySchema>;
+ export type AbuseBlockerReportModel = z.infer<typeof AbuseBlockerReportSchema>;
+diff --git a/src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts b/src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts
+index 6fe9e56..9bb607e 100644
+--- a/src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts
++++ b/src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts
+@@ -14,31 +14,65 @@ import {
+ 
+ import { NftService } from '../../services/nft.service';
+ import { PluginStateService } from '../../services/plugin-state.service';
++import { parseDomainEndpoint } from '../../utils/domain.utils';
+ import { parseNetworkEndpoint } from '../../utils/ip-address.utils';
+ import { XrayWebhookEvent } from './xray-webhook.event';
+ 
+ const WEBHOOK_TIMEOUT_MS = 5_000;
+ 
++/**
++ * Maps a routing webhook to an observation. An IP target is always preferred.
++ * With `domains`, a request by hostname becomes a hostname observation instead of
++ * being dropped (Xray never puts a resolved IP into the webhook).
++ */
+ export const toAbuseBlockerObservation = (
+     webhook: XrayWebhookModel,
++    options: { domains?: boolean } = {},
+ ): IAbuseBlockerObservation | null => {
+     if (webhook.network.toLowerCase() !== 'tcp') return null;
+     if (!webhook.email || !/^\d+$/.test(webhook.email)) return null;
+ 
+     const source = parseNetworkEndpoint(webhook.source);
+-    const destination = [webhook.originalTarget, webhook.routeTarget, webhook.destination]
+-        .map(parseNetworkEndpoint)
+-        .find((candidate) => candidate?.port && candidate.port >= 1 && candidate.port <= 65535);
+-    if (!source || !destination?.port) return null;
++    if (!source) return null;
++    const targets = [webhook.originalTarget, webhook.routeTarget, webhook.destination];
++    let destination: ReturnType<typeof parseNetworkEndpoint> = null;
++    for (const target of targets) {
++        const candidate = parseNetworkEndpoint(target);
++        if (candidate?.port && candidate.port >= 1 && candidate.port <= 65535) {
++            destination = candidate;
++            break;
++        }
++    }
+ 
+-    return {
++    const observation = {
+         userId: webhook.email,
+         sourceIp: source.ip,
+-        destinationIp: destination.ip,
+-        destinationPort: destination.port,
++        inboundTag: webhook.inboundTag,
+         timestamp: Number.isFinite(webhook.ts) ? webhook.ts * 1000 : Date.now(),
+         xrayReport: webhook,
+     };
++    if (destination?.port) {
++        return {
++            ...observation,
++            destinationIp: destination.ip,
++            destinationHost: null,
++            destinationPort: destination.port,
++        };
++    }
++    if (!options.domains) return null;
++
++    let domain: ReturnType<typeof parseDomainEndpoint> = null;
++    for (const target of targets) {
++        domain = parseDomainEndpoint(target);
++        if (domain) break;
++    }
++    if (!domain) return null;
++    return {
++        ...observation,
++        destinationIp: null,
++        destinationHost: domain.host,
++        destinationPort: domain.port,
++    };
+ };
+ 
+ @EventsHandler(XrayWebhookEvent)
+@@ -111,7 +145,7 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
+         const state = this.pluginState.abuseBlocker;
+         if (!state.isEnabled) return;
+ 
+-        const observation = toAbuseBlockerObservation(webhook);
++        const observation = toAbuseBlockerObservation(webhook, { domains: state.acceptsDomains });
+         if (!observation) return;
+ 
+         const analysis = state.analyze(observation);
+@@ -120,9 +154,12 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
+         const policy = state.policy;
+         if (!policy) return;
+ 
++        const shouldBlock = analysis.shouldBlock && policy.mode === 'block';
++        const skipReason =
++            analysis.skipReason ?? (analysis.shouldBlock && !shouldBlock ? 'report_only' : null);
+         let blocked = false;
+         let blockError: string | null = null;
+-        if (analysis.shouldBlock) {
++        if (shouldBlock) {
+             try {
+                 await this.nftService.blockAbuseIp(
+                     observation.sourceIp,
+@@ -140,7 +177,10 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
+             eventId: randomUUID(),
+             userId: observation.userId,
+             sourceIp: observation.sourceIp,
++            sourceIpUserCount: analysis.sourceIpUserCount,
++            inboundTag: observation.inboundTag ?? null,
+             destinationIp: observation.destinationIp,
++            destinationHost: observation.destinationHost ?? null,
+             destinationPort: observation.destinationPort,
+             detectedAt: new Date(observation.timestamp),
+             detections: analysis.detections,
+@@ -153,14 +193,15 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
+             severity: analysis.severity,
+             evidence: analysis.evidence,
+             actionReport: {
+-                action: analysis.shouldBlock ? 'ip_block' : 'none',
++                action: shouldBlock ? 'ip_block' : 'none',
+                 blocked,
+-                blockDuration: analysis.shouldBlock ? policy.initialBlockSeconds : 0,
++                blockDuration: shouldBlock ? policy.initialBlockSeconds : 0,
+                 willUnblockAt:
+-                    analysis.shouldBlock && blocked
++                    shouldBlock && blocked
+                         ? new Date(processedAt.getTime() + policy.initialBlockSeconds * 1000)
+                         : null,
+                 error: blockError,
++                skipReason,
+                 processedAt,
+             },
+             policy,
+@@ -171,7 +212,7 @@ export class XrayWebhookHandler implements IEventHandler<XrayWebhookEvent> {
+ 
+         state.addReport(report);
+         this.logger.log(
+-            `[ABUSE-BLOCKER] user=${observation.userId}, source=${observation.sourceIp}, score=${analysis.scoreAfter}, severity=${analysis.severity}, blocked=${blocked}`,
++            `[ABUSE-BLOCKER] user=${observation.userId}, source=${observation.sourceIp}, score=${analysis.scoreAfter}, severity=${analysis.severity}, blocked=${blocked}${skipReason ? `, skip=${skipReason}` : ''}`,
+         );
+     }
+ 
+diff --git a/src/modules/_plugin/services/states/abuse-blocker.state.ts b/src/modules/_plugin/services/states/abuse-blocker.state.ts
+index e6827d1..e1f2ae4 100644
+--- a/src/modules/_plugin/services/states/abuse-blocker.state.ts
++++ b/src/modules/_plugin/services/states/abuse-blocker.state.ts
+@@ -2,16 +2,57 @@ import type { TNodePlugin } from '@remnawave/node-plugins';
+ 
+ import type {
+     AbuseBlockerCoverageMode,
++    AbuseBlockerDetectionPhase,
+     AbuseBlockerPolicy,
+     AbuseBlockerReportModel,
+     AbuseBlockerRuleName,
+     AbuseBlockerSeverity,
++    AbuseBlockerSkipReason,
+     XrayWebhookModel,
+ } from '@libs/contracts/models';
+ 
++import { getRegistrableDomain, hashHostname } from '../../utils/domain.utils';
+ import { getNetworkKey, IpMatcher } from '../../utils/ip-address.utils';
+ 
+ type AbuseBlockerConfig = NonNullable<TNodePlugin['abuseBlocker']>;
++type AbuseBlockerDetectionUnit = IAbuseBlockerDetection['unit'];
++
++const NON_PUBLIC_SOURCES = [
++    '0.0.0.0/8',
++    '10.0.0.0/8',
++    '100.64.0.0/10',
++    '127.0.0.0/8',
++    '169.254.0.0/16',
++    '172.16.0.0/12',
++    '192.168.0.0/16',
++    '::1/128',
++    'fc00::/7',
++    'fe80::/10',
++];
++const MAX_USERS_PER_SOURCE_TRACKED = 16;
++const SOURCE_LRU_REFRESH_MS = 60_000;
++const HAMMER_BUCKETS = 15;
++const BURST_BUCKETS = 12;
++const WEB_PORTS = new Set([80, 443]);
++
++/** Two-pass confirmation state of one v2 key (see evaluateIncident). */
++interface IIncidentState {
++    candidateAt: number | null;
++    lastCandidateAt: number;
++    lastFiredAt: number;
++}
++
++/** Distinct members (networks, domain or hostname hashes) with last-seen time, oldest first. */
++interface IMemberSetState extends IIncidentState {
++    members: Map<string | number, number>;
++}
++
++/** Rolling counter: `buckets` slots ending at absolute slot `head`. */
++interface IRingCounterState extends IIncidentState {
++    buckets: Uint16Array;
++    head: number;
++    total: number;
++}
+ 
+ interface IDetectorKeyState {
+     destinations: Map<string, number>;
+@@ -25,13 +66,22 @@ interface IUserState {
+     sweep: Map<string, IDetectorKeyState>;
+     scoreEvents: Array<{ score: number; timestamp: number }>;
+     lastSeenAt: number;
++    networks: Map<number, IMemberSetState>;
++    targets: Map<string, IRingCounterState>;
++    domainSweep: Map<number, IMemberSetState>;
++    subdomains: Map<number, IMemberSetState>;
++    burst: IRingCounterState | null;
+ }
+ 
+ export interface IAbuseBlockerObservation {
+     userId: string;
+     sourceIp: string;
+-    destinationIp: string;
++    /** Null when the client asked for a hostname (see destinationHost). */
++    destinationIp: string | null;
++    /** Normalized ASCII hostname, only when no IP is known. */
++    destinationHost?: string | null;
+     destinationPort: number;
++    inboundTag?: string | null;
+     timestamp: number;
+     xrayReport: XrayWebhookModel;
+ }
+@@ -43,6 +93,9 @@ export interface IAbuseBlockerDetection {
+     windowSeconds: number;
+     score: number;
+     subnet: string | null;
++    phase: AbuseBlockerDetectionPhase;
++    count: number;
++    unit: 'destinations' | 'networks' | 'sessions' | 'domains' | 'hostnames';
+ }
+ 
+ export interface IAbuseBlockerAnalysis {
+@@ -53,8 +106,99 @@ export interface IAbuseBlockerAnalysis {
+     severity: AbuseBlockerSeverity;
+     evidence: Array<{ destinationIp: string; destinationPort: number; lastSeenAt: Date }>;
+     shouldBlock: boolean;
++    skipReason: AbuseBlockerSkipReason | null;
++    sourceIpUserCount: number;
+ }
+ 
++const createIncident = (): IIncidentState => ({
++    candidateAt: null,
++    lastCandidateAt: Number.NEGATIVE_INFINITY,
++    lastFiredAt: Number.NEGATIVE_INFINITY,
++});
++
++const createMemberSet = (): IMemberSetState => ({ ...createIncident(), members: new Map() });
++
++const createRing = (slots: number, head: number): IRingCounterState => ({
++    ...createIncident(),
++    buckets: new Uint16Array(slots),
++    head,
++    total: 0,
++});
++
++/** Adds `member` at `now`, drops members older than the window, returns the distinct count. */
++const touchMember = (
++    state: IMemberSetState,
++    member: string | number,
++    now: number,
++    windowMs: number,
++    cap: number,
++): number => {
++    const cutoff = now - windowMs;
++    for (const [key, seenAt] of state.members) {
++        if (seenAt >= cutoff) break;
++        state.members.delete(key);
++    }
++    state.members.delete(member);
++    state.members.set(member, now);
++    if (state.members.size > cap) state.members.delete(state.members.keys().next().value!);
++    return state.members.size;
++};
++
++/** Counts one session at `now` and returns the total over the ring. */
++const addToRing = (ring: IRingCounterState, now: number, slotMs: number): number => {
++    const slots = ring.buckets.length;
++    const slot = Math.floor(now / slotMs);
++    if (slot > ring.head) {
++        const clear = Math.min(slot - ring.head, slots);
++        for (let step = 1; step <= clear; step += 1) {
++            const index = (ring.head + step) % slots;
++            ring.total -= ring.buckets[index];
++            ring.buckets[index] = 0;
++        }
++        ring.head = slot;
++    } else if (ring.head - slot >= slots) {
++        return ring.total;
++    }
++    const index = slot % slots;
++    if (ring.buckets[index] < 0xffff) {
++        ring.buckets[index] += 1;
++        ring.total += 1;
++    }
++    return ring.total;
++};
++
++const oldestKeys = new WeakMap<Map<unknown, unknown>, Iterator<unknown>>();
++
++/**
++ * Deletes the oldest key of an insertion-ordered map. A long-lived iterator is
++ * kept because `keys().next()` walks over every deleted slot at the front of the
++ * table, which makes LRU eviction O(n) under churn.
++ */
++const deleteOldest = <K>(map: Map<K, unknown>): void => {
++    let iterator = oldestKeys.get(map) as Iterator<K> | undefined;
++    let next = iterator?.next();
++    if (!iterator || !next || next.done) {
++        iterator = map.keys();
++        oldestKeys.set(map, iterator);
++        next = iterator.next();
++    }
++    if (!next.done) map.delete(next.value);
++};
++
++/** Map used as an LRU with at most `cap` entries. */
++const getOrCreate = <K, V>(map: Map<K, V>, key: K, cap: number, create: () => V): V => {
++    const existing = map.get(key);
++    if (existing !== undefined) {
++        map.delete(key);
++        map.set(key, existing);
++        return existing;
++    }
++    if (map.size >= cap) deleteOldest(map);
++    const created = create();
++    map.set(key, created);
++    return created;
++};
++
+ export class AbuseBlockerState {
+     private enabled = false;
+     private config: AbuseBlockerConfig | null = null;
+@@ -62,6 +206,12 @@ export class AbuseBlockerState {
+     private ignoredUsers = new Set<string>();
+     private ignoredSources = new IpMatcher([]);
+     private ignoredDestinations = new IpMatcher([]);
++    private excludedPorts = new Set<number>();
++    private scanPorts = new Set<number>();
++    private reportOnlyUsers = new Set<string>();
++    private reportOnlyInbounds = new Set<string>();
++    private readonly nonPublicSources = new IpMatcher(NON_PUBLIC_SOURCES);
++    private sources = new Map<string, { users: Map<string, number>; touchedAt: number }>();
+     private users = new Map<string, IUserState>();
+     private reports = new Map<string, AbuseBlockerReportModel>();
+     private coverageMode: AbuseBlockerCoverageMode = 'partial';
+@@ -95,9 +245,24 @@ export class AbuseBlockerState {
+             reportBufferSize: config.reportBufferSize,
+             horizontalScan: config.horizontalScan,
+             destinationSweep: config.destinationSweep,
++            mode: config.mode,
++            ruleSet: config.ruleSet,
++            scanPorts: config.scanPorts,
++            confirmationSeconds: config.confirmationSeconds,
++            rearmAfterCooldown: config.rearmAfterCooldown,
++            horizontalSweep: config.horizontalSweep,
++            hammerTarget: config.hammerTarget,
++            sessionRateBurst: config.sessionRateBurst,
++            domains: config.domains,
++            sourceGuards: config.sourceGuards,
+         };
+     }
+ 
++    /** Whether hostname destinations should be mapped to observations (v2 rules). */
++    get acceptsDomains(): boolean {
++        return this.enabled && !!this.config && this.config.ruleSet !== 'legacy';
++    }
++
+     get fingerprint(): string {
+         return this.configFingerprint;
+     }
+@@ -119,6 +284,10 @@ export class AbuseBlockerState {
+         this.ignoredUsers = new Set(args.ignoredUsers);
+         this.ignoredSources = new IpMatcher(args.ignoredSources);
+         this.ignoredDestinations = new IpMatcher(args.ignoredDestinations);
++        this.excludedPorts = new Set(args.config.excludedPorts);
++        this.scanPorts = new Set(args.config.scanPorts);
++        this.reportOnlyUsers = new Set(args.config.sourceGuards.reportOnlyUserIds.map(String));
++        this.reportOnlyInbounds = new Set(args.config.sourceGuards.reportOnlyInboundTags);
+     }
+ 
+     analyze(observation: IAbuseBlockerObservation): IAbuseBlockerAnalysis | null {
+@@ -126,17 +295,28 @@ export class AbuseBlockerState {
+         if (!this.enabled || !config) return null;
+         if (this.ignoredUsers.has(observation.userId)) return null;
+         if (this.ignoredSources.matches(observation.sourceIp)) return null;
+-        if (this.ignoredDestinations.matches(observation.destinationIp)) return null;
+-        if (config.excludedPorts.includes(observation.destinationPort)) return null;
++        const destinationIp = observation.destinationIp;
++        if (destinationIp !== null && this.ignoredDestinations.matches(destinationIp)) return null;
++        this.trackSourceUser(observation);
++
++        // With a scanPorts allowlist, only those ports feed port-geometry rules (the
++        // allowlist wins over excludedPorts); other non-excluded ports feed only the
++        // report-only session counter.
++        const excluded = this.excludedPorts.has(observation.destinationPort);
++        const inScope =
++            this.scanPorts.size > 0 ? this.scanPorts.has(observation.destinationPort) : !excluded;
++        if (excluded && !inScope) return null;
+ 
+         const user = this.getUserState(observation.userId, observation.timestamp);
+         this.pruneScore(user, observation.timestamp, config.scoreWindowSeconds);
+         const scoreBefore = user.scoreEvents.reduce((sum, event) => sum + event.score, 0);
+         const detections: IAbuseBlockerDetection[] = [];
++        const blockEligible: boolean[] = [];
++        const legacy = config.ruleSet !== 'v2' && inScope && destinationIp !== null;
+ 
+-        if (config.horizontalScan.enabled) {
++        if (legacy && config.horizontalScan.enabled) {
+             const subnet = getNetworkKey(
+-                observation.destinationIp,
++                destinationIp,
+                 config.horizontalScan.ipv4Prefix,
+                 config.horizontalScan.ipv6Prefix,
+             );
+@@ -151,7 +331,8 @@ export class AbuseBlockerState {
+                 if (
+                     this.recordDestination(
+                         state,
+-                        observation,
++                        destinationIp,
++                        observation.timestamp,
+                         config.horizontalScan.windowSeconds,
+                         config.horizontalScan.uniqueDestinations,
+                         config.incidentCooldownSeconds,
+@@ -164,18 +345,23 @@ export class AbuseBlockerState {
+                         windowSeconds: config.horizontalScan.windowSeconds,
+                         score: config.horizontalScan.score,
+                         subnet,
++                        phase: 'single',
++                        count: state.destinations.size,
++                        unit: 'destinations',
+                     });
++                    blockEligible.push(true);
+                 }
+             }
+         }
+ 
+-        if (config.destinationSweep.enabled) {
++        if (legacy && config.destinationSweep.enabled) {
+             const key = String(observation.destinationPort);
+             const state = this.getDetectorState(user.sweep, key, user, observation.timestamp);
+             if (
+                 this.recordDestination(
+                     state,
+-                    observation,
++                    destinationIp,
++                    observation.timestamp,
+                     config.destinationSweep.windowSeconds,
+                     config.destinationSweep.uniqueDestinations,
+                     config.incidentCooldownSeconds,
+@@ -188,10 +374,18 @@ export class AbuseBlockerState {
+                     windowSeconds: config.destinationSweep.windowSeconds,
+                     score: config.destinationSweep.score,
+                     subnet: null,
++                    phase: 'single',
++                    count: state.destinations.size,
++                    unit: 'destinations',
+                 });
++                blockEligible.push(true);
+             }
+         }
+ 
++        if (config.ruleSet !== 'legacy') {
++            this.detectV2(user, observation, { excluded, inScope }, detections, blockEligible);
++        }
++
+         if (detections.length === 0) {
+             this.updateBufferedEvidence(observation.userId, user, observation.destinationPort);
+             return null;
+@@ -202,14 +396,27 @@ export class AbuseBlockerState {
+         const scoreAfter = scoreBefore + scoreDelta;
+         if (scoreAfter < config.suspiciousScore) return null;
+ 
+-        const severity: AbuseBlockerSeverity =
+-            scoreAfter >= config.blockScore
+-                ? 'blocked'
+-                : scoreAfter >= config.alertScore
+-                  ? 'alert'
+-                  : 'suspicious';
++        // Only a confirmed, block-eligible detection can make a decision a block
++        // (legacy detections count as confirmed when confirmation is off).
++        const confirmed = detections.some(
++            (detection, index) =>
++                blockEligible[index] &&
++                (detection.phase === 'confirmed' ||
++                    (detection.phase === 'single' && config.confirmationSeconds === 0)),
++        );
++        const wouldBlock = confirmed && scoreAfter >= config.blockScore;
++        const severity: AbuseBlockerSeverity = wouldBlock
++            ? 'blocked'
++            : scoreAfter >= config.alertScore
++              ? 'alert'
++              : 'suspicious';
+         const evidenceLimit =
+             scoreAfter >= config.alertScore ? config.enhancedEvidenceLimit : config.evidenceLimit;
++        const sourceIpUserCount = this.countSourceUsers(
++            observation.sourceIp,
++            observation.timestamp,
++        );
++        const skipReason = wouldBlock ? this.blockSkipReason(observation, sourceIpUserCount) : null;
+ 
+         return {
+             detections,
+@@ -218,15 +425,16 @@ export class AbuseBlockerState {
+             scoreAfter,
+             severity,
+             evidence: this.collectEvidence(user, observation.destinationPort, evidenceLimit),
+-            shouldBlock: scoreAfter >= config.blockScore,
++            shouldBlock: wouldBlock && skipReason === null,
++            skipReason,
++            sourceIpUserCount,
+         };
+     }
+ 
+     addReport(report: AbuseBlockerReportModel): void {
+         const limit = this.config?.reportBufferSize ?? 1;
+         if (!this.reports.has(report.eventId) && this.reports.size >= limit) {
+-            const oldest = this.reports.keys().next().value as string | undefined;
+-            if (oldest) this.reports.delete(oldest);
++            deleteOldest(this.reports);
+             this.droppedReports += 1;
+         }
+         this.reports.set(report.eventId, report);
+@@ -260,6 +468,7 @@ export class AbuseBlockerState {
+                     ).length,
+                 0,
+             ),
++            trackedSources: this.sources.size,
+             coverageMode: this.coverageMode,
+             skippedWebhookRules: this.skippedWebhookRules,
+             evictedUsers: this.evictedUsers,
+@@ -276,6 +485,11 @@ export class AbuseBlockerState {
+         this.ignoredUsers.clear();
+         this.ignoredSources = new IpMatcher([]);
+         this.ignoredDestinations = new IpMatcher([]);
++        this.excludedPorts.clear();
++        this.scanPorts.clear();
++        this.reportOnlyUsers.clear();
++        this.reportOnlyInbounds.clear();
++        this.sources.clear();
+         this.users.clear();
+         this.reports.clear();
+         this.coverageMode = 'partial';
+@@ -297,8 +511,7 @@ export class AbuseBlockerState {
+ 
+         const config = this.config!;
+         if (this.users.size >= config.maxTrackedUsers) {
+-            const oldest = this.users.keys().next().value as string | undefined;
+-            if (oldest) this.users.delete(oldest);
++            deleteOldest(this.users);
+             this.evictedUsers += 1;
+         }
+ 
+@@ -307,6 +520,11 @@ export class AbuseBlockerState {
+             sweep: new Map(),
+             scoreEvents: [],
+             lastSeenAt: timestamp,
++            networks: new Map(),
++            targets: new Map(),
++            domainSweep: new Map(),
++            subdomains: new Map(),
++            burst: null,
+         };
+         this.users.set(userId, state);
+         return state;
+@@ -358,34 +576,287 @@ export class AbuseBlockerState {
+ 
+     private recordDestination(
+         state: IDetectorKeyState,
+-        observation: IAbuseBlockerObservation,
++        destinationIp: string,
++        timestamp: number,
+         windowSeconds: number,
+         threshold: number,
+         cooldownSeconds: number,
+     ): boolean {
+-        const cutoff = observation.timestamp - windowSeconds * 1000;
++        const cutoff = timestamp - windowSeconds * 1000;
+         for (const [destination, lastSeenAt] of state.destinations) {
+             if (lastSeenAt < cutoff) state.destinations.delete(destination);
+         }
+ 
++        // rearmAfterCooldown: a key that stays above its threshold fires again after
++        // the cooldown, instead of staying latched for as long as the scan lasts.
+         if (
+             state.fired &&
+-            state.destinations.size < threshold &&
+-            observation.timestamp - state.lastFiredAt >= cooldownSeconds * 1000
++            (this.config!.rearmAfterCooldown || state.destinations.size < threshold) &&
++            timestamp - state.lastFiredAt >= cooldownSeconds * 1000
+         ) {
+             state.fired = false;
+         }
+ 
+-        state.destinations.set(observation.destinationIp, observation.timestamp);
+-        state.lastSeenAt = observation.timestamp;
++        state.destinations.set(destinationIp, timestamp);
++        state.lastSeenAt = timestamp;
+         if (state.fired || state.destinations.size < threshold) return false;
+-        if (observation.timestamp - state.lastFiredAt < cooldownSeconds * 1000) return false;
++        if (timestamp - state.lastFiredAt < cooldownSeconds * 1000) return false;
+ 
+         state.fired = true;
+-        state.lastFiredAt = observation.timestamp;
++        state.lastFiredAt = timestamp;
+         return true;
+     }
+ 
++    /**
++     * v2 rules. Port-geometry rules only see scan ports; hostnames never share a key
++     * with IPs and never enter /24 geometry; hostnames are kept as hashes.
++     */
++    private detectV2(
++        user: IUserState,
++        observation: IAbuseBlockerObservation,
++        scope: { excluded: boolean; inScope: boolean },
++        detections: IAbuseBlockerDetection[],
++        blockEligible: boolean[],
++    ): void {
++        const config = this.config!;
++        const now = observation.timestamp;
++        const port = observation.destinationPort;
++        const push = (
++            rule: AbuseBlockerRuleName,
++            key: string,
++            state: IIncidentState,
++            count: number,
++            threshold: number,
++            ruleConfig: { windowSeconds: number; score: number; blockEligible: boolean },
++            unit: AbuseBlockerDetectionUnit,
++            subnet: string | null = null,
++        ) => {
++            const phase = this.evaluateIncident(state, count, threshold, now);
++            if (!phase) return;
++            detections.push({
++                rule,
++                key,
++                uniqueDestinations: count,
++                windowSeconds: ruleConfig.windowSeconds,
++                score: ruleConfig.score,
++                subnet,
++                phase,
++                count,
++                unit,
++            });
++            blockEligible.push(ruleConfig.blockEligible);
++        };
++
++        const burst = config.sessionRateBurst;
++        if (burst.enabled && !scope.excluded) {
++            const slotMs = (burst.windowSeconds * 1000) / BURST_BUCKETS;
++            user.burst ??= createRing(BURST_BUCKETS, Math.floor(now / slotMs));
++            const count = addToRing(user.burst, now, slotMs);
++            push(
++                'session_rate_burst',
++                'user',
++                user.burst,
++                count,
++                burst.sessions,
++                burst,
++                'sessions',
++            );
++        }
++        if (!scope.inScope) return;
++
++        const hammer = config.hammerTarget;
++        const countHammer = (targetKey: string, label: string) => {
++            if (!hammer.enabled) return;
++            const slotMs = (hammer.windowSeconds * 1000) / HAMMER_BUCKETS;
++            const ring = getOrCreate(user.targets, targetKey, hammer.maxTargetsPerUser, () =>
++                createRing(HAMMER_BUCKETS, Math.floor(now / slotMs)),
++            );
++            const count = addToRing(ring, now, slotMs);
++            push(
++                'hammer_target',
++                `${port}|${label}`,
++                ring,
++                count,
++                hammer.sessions,
++                hammer,
++                'sessions',
++            );
++        };
++
++        const destinationIp = observation.destinationIp;
++        if (destinationIp !== null) {
++            const sweep = config.horizontalSweep;
++            if (sweep.enabled) {
++                const network = getNetworkKey(destinationIp, sweep.ipv4Prefix, sweep.ipv6Prefix);
++                if (network) {
++                    const state = getOrCreate(user.networks, port, 1024, createMemberSet);
++                    const count = touchMember(
++                        state,
++                        network,
++                        now,
++                        sweep.windowSeconds * 1000,
++                        sweep.maxNetworksPerKey,
++                    );
++                    push(
++                        'horizontal_sweep',
++                        String(port),
++                        state,
++                        count,
++                        sweep.uniqueNetworks,
++                        sweep,
++                        'networks',
++                    );
++                }
++            }
++            countHammer(`${port}|${destinationIp}`, destinationIp);
++            return;
++        }
++
++        const host = observation.destinationHost;
++        if (!host || !config.domains.enabled || WEB_PORTS.has(port)) return;
++        const hostHash = hashHostname(host);
++        countHammer(`${port}|#${hostHash}`, host);
++
++        const domain = getRegistrableDomain(host);
++        if (!domain) return;
++        const domainHash = hashHostname(domain);
++
++        const domainSweep = config.domains.sweep;
++        if (domainSweep.enabled) {
++            const state = getOrCreate(user.domainSweep, port, 1024, createMemberSet);
++            const count = touchMember(
++                state,
++                domainHash,
++                now,
++                domainSweep.windowSeconds * 1000,
++                domainSweep.maxDomainsPerKey,
++            );
++            push(
++                'horizontal_sweep_domains',
++                String(port),
++                state,
++                count,
++                domainSweep.uniqueDomains,
++                domainSweep,
++                'domains',
++            );
++        }
++
++        const subdomainSweep = config.domains.subdomainSweep;
++        if (subdomainSweep.enabled) {
++            const state = getOrCreate(
++                user.subdomains,
++                domainHash,
++                subdomainSweep.maxDomainsPerUser,
++                createMemberSet,
++            );
++            const count = touchMember(
++                state,
++                hostHash,
++                now,
++                subdomainSweep.windowSeconds * 1000,
++                subdomainSweep.maxHostsPerKey,
++            );
++            push(
++                'subdomain_sweep',
++                domain,
++                state,
++                count,
++                subdomainSweep.uniqueHosts,
++                subdomainSweep,
++                'hostnames',
++            );
++        }
++    }
++
++    /**
++     * First time a key reaches its threshold: 'candidate' (reported). At least
++     * confirmationSeconds later, still at or above: 'confirmed' (block-eligible), and
++     * again every incidentCooldownSeconds while it stays there. Dropping below the
++     * threshold expires the candidate.
++     */
++    private evaluateIncident(
++        state: IIncidentState,
++        count: number,
++        threshold: number,
++        now: number,
++    ): AbuseBlockerDetectionPhase | null {
++        if (count < threshold) {
++            state.candidateAt = null;
++            return null;
++        }
++        const config = this.config!;
++        const cooldownMs = config.incidentCooldownSeconds * 1000;
++        const confirmationMs = config.confirmationSeconds * 1000;
++        if (now - state.lastFiredAt < cooldownMs) return null;
++
++        if (state.candidateAt === null) {
++            state.candidateAt = now;
++            if (confirmationMs > 0) {
++                if (now - state.lastCandidateAt < cooldownMs) return null;
++                state.lastCandidateAt = now;
++                return 'candidate';
++            }
++        }
++        if (now - state.candidateAt < confirmationMs) return null;
++
++        state.lastFiredAt = now;
++        return 'confirmed';
++    }
++
++    /**
++     * Remembers which users used a source address: an LRU of sources (position
++     * refreshed at most once a minute) with at most 16 users each.
++     */
++    private trackSourceUser(observation: IAbuseBlockerObservation): void {
++        const { sourceIp, userId, timestamp } = observation;
++        let source = this.sources.get(sourceIp);
++        if (!source) {
++            if (this.sources.size >= this.config!.sourceGuards.maxTrackedSources) {
++                deleteOldest(this.sources);
++            }
++            source = { users: new Map(), touchedAt: timestamp };
++            this.sources.set(sourceIp, source);
++        } else if (timestamp - source.touchedAt >= SOURCE_LRU_REFRESH_MS) {
++            this.sources.delete(sourceIp);
++            this.sources.set(sourceIp, source);
++            source.touchedAt = timestamp;
++        }
++        if (!source.users.has(userId) && source.users.size >= MAX_USERS_PER_SOURCE_TRACKED) {
++            source.users.delete(source.users.keys().next().value!);
++        }
++        source.users.set(userId, timestamp);
++    }
++
++    /** Distinct users on the source in the guard window; saturates at 16. */
++    private countSourceUsers(sourceIp: string, timestamp: number): number {
++        const users = this.sources.get(sourceIp)?.users;
++        if (!users) return 0;
++        const cutoff = timestamp - this.config!.sourceGuards.userWindowSeconds * 1000;
++        let count = 0;
++        for (const lastSeenAt of users.values()) {
++            if (lastSeenAt >= cutoff) count += 1;
++        }
++        return count;
++    }
++
++    private blockSkipReason(
++        observation: IAbuseBlockerObservation,
++        sourceIpUserCount: number,
++    ): AbuseBlockerSkipReason | null {
++        const guards = this.config!.sourceGuards;
++        if (!guards.enabled) return null;
++        if (!guards.blockNonPublicSources && this.nonPublicSources.matches(observation.sourceIp)) {
++            return 'non_public_source';
++        }
++        if (this.reportOnlyUsers.has(observation.userId)) return 'report_only_user';
++        if (observation.inboundTag && this.reportOnlyInbounds.has(observation.inboundTag)) {
++            return 'report_only_inbound';
++        }
++        if (sourceIpUserCount > guards.maxUsersPerSource) return 'shared_source';
++        return null;
++    }
++
+     private collectEvidence(
+         user: IUserState,
+         destinationPort: number,
+diff --git a/src/modules/_plugin/utils/domain.utils.ts b/src/modules/_plugin/utils/domain.utils.ts
+new file mode 100644
+index 0000000..7c40672
+--- /dev/null
++++ b/src/modules/_plugin/utils/domain.utils.ts
+@@ -0,0 +1,74 @@
++import { randomInt } from 'node:crypto';
++import { isIP } from 'node:net';
++import { domainToASCII } from 'node:url';
++import { getDomain } from 'tldts';
++
++const LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/;
++const PLAIN_ASCII = /^[a-z0-9._-]+$/;
++
++/**
++ * Lowercase ASCII (punycode) hostname, or null for IP literals and garbage.
++ */
++export const normalizeHostname = (input: string): string | null => {
++    const trimmed = input.trim().replace(/\.$/, '');
++    if (!trimmed || trimmed.length > 253 || isIP(trimmed.replace(/^\[|\]$/g, ''))) return null;
++
++    // Lowercase LDH names without punycode are already in ASCII form.
++    const ascii =
++        PLAIN_ASCII.test(trimmed) && !trimmed.includes('xn--') ? trimmed : domainToASCII(trimmed);
++    if (!ascii || ascii.length > 253) return null;
++
++    const labels = ascii.split('.');
++    if (labels.length < 2 || !labels.every((label) => LABEL.test(label))) return null;
++
++    return ascii;
++};
++
++/**
++ * Registrable domain (eTLD+1) from the Public Suffix List, private section
++ * included. Unknown and reserved TLDs fall back to the implicit "*" rule.
++ */
++export const getRegistrableDomain = (hostname: string): string | null =>
++    getDomain(hostname, {
++        allowPrivateDomains: true,
++        extractHostname: false,
++        validateHostname: false,
++    });
++
++export interface IParsedDomainEndpoint {
++    host: string;
++    port: number;
++}
++
++/** `tcp:host.example:22` or `host.example:22` -> normalized host and port. */
++export const parseDomainEndpoint = (input: string | null): IParsedDomainEndpoint | null => {
++    if (!input) return null;
++    const value = input.replace(/^(?:tcp|udp):/i, '');
++    const separator = value.lastIndexOf(':');
++    if (separator <= 0) return null;
++
++    const port = Number(value.slice(separator + 1));
++    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
++
++    const host = normalizeHostname(value.slice(0, separator));
++    return host ? { host, port } : null;
++};
++
++const HASH_SEED = randomInt(0, 2 ** 31);
++
++/**
++ * 53-bit string hash (cyrb53) with a per-process seed, so that state keeps
++ * fixed-size numbers instead of hostnames.
++ */
++export const hashHostname = (value: string): number => {
++    let h1 = 0xdeadbeef ^ HASH_SEED;
++    let h2 = 0x41c6ce57 ^ HASH_SEED;
++    for (let index = 0; index < value.length; index += 1) {
++        const code = value.charCodeAt(index);
++        h1 = Math.imul(h1 ^ code, 2654435761);
++        h2 = Math.imul(h2 ^ code, 1597334677);
++    }
++    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
++    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
++    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
++};
+diff --git a/src/modules/_plugin/utils/ip-address.utils.ts b/src/modules/_plugin/utils/ip-address.utils.ts
+index a5a4f74..f4e1e50 100644
+--- a/src/modules/_plugin/utils/ip-address.utils.ts
++++ b/src/modules/_plugin/utils/ip-address.utils.ts
+@@ -69,6 +69,10 @@ export const parseIpAddress = (input: string): IParsedIpAddress | null => {
+     return null;
+ };
+ 
++/** Same answer as `parseIpAddress(input) !== null`, without building the BigInt. */
++export const isIpAddress = (input: string): boolean =>
++    isIP(input.replace(/^\[|\]$/g, '').split('%')[0]) !== 0;
++
+ export const getNetworkKey = (
+     ip: string,
+     ipv4Prefix: number,
+@@ -108,6 +112,7 @@ export class IpMatcher {
+     }
+ 
+     matches(ip: string): boolean {
++        if (this.ranges.length === 0) return false;
+         const parsed = parseIpAddress(ip);
+         if (!parsed) return false;
+ 
+@@ -133,19 +138,19 @@ export const parseNetworkEndpoint = (input: string | null): IParsedNetworkEndpoi
+         const closingBracket = value.indexOf(']');
+         if (closingBracket < 0) return null;
+         const ip = value.slice(1, closingBracket);
+-        if (!parseIpAddress(ip)) return null;
++        if (!isIpAddress(ip)) return null;
+         const rawPort = value.slice(closingBracket + 1).replace(/^:/, '');
+         const port = rawPort ? Number(rawPort) : null;
+         return { ip, port: Number.isInteger(port) ? port : null };
+     }
+ 
+-    if (parseIpAddress(value)) return { ip: value, port: null };
++    if (isIpAddress(value)) return { ip: value, port: null };
+ 
+     const separator = value.lastIndexOf(':');
+     if (separator < 0) return null;
+     const ip = value.slice(0, separator);
+     const port = Number(value.slice(separator + 1));
+-    if (!parseIpAddress(ip) || !Number.isInteger(port)) return null;
++    if (!isIpAddress(ip) || !Number.isInteger(port)) return null;
+ 
+     return { ip, port };
+ };
+diff --git a/tests/abuse-blocker/abuse-blocker.detection.test.ts b/tests/abuse-blocker/abuse-blocker.detection.test.ts
+new file mode 100644
+index 0000000..9ee5f13
+--- /dev/null
++++ b/tests/abuse-blocker/abuse-blocker.detection.test.ts
+@@ -0,0 +1,414 @@
++import type { XrayWebhookModel } from '../../libs/contract/models';
++
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++
++import { NodePluginSchema } from '@remnawave/node-plugins';
++
++import { toAbuseBlockerObservation } from '../../src/modules/_plugin/events/xray-webhook/xray-webhook.handler';
++import { AbuseBlockerState } from '../../src/modules/_plugin/services/states/abuse-blocker.state';
++import {
++    getRegistrableDomain,
++    normalizeHostname,
++} from '../../src/modules/_plugin/utils/domain.utils';
++
++const webhook: XrayWebhookModel = {
++    email: '42',
++    level: 0,
++    protocol: null,
++    network: 'tcp',
++    source: '198.51.100.10:12345',
++    destination: '192.0.2.1:22',
++    routeTarget: null,
++    originalTarget: null,
++    inboundTag: 'VLESS',
++    inboundName: null,
++    inboundLocal: null,
++    outboundTag: 'DIRECT',
++    ts: 0,
++};
++
++const createState = (overrides: Record<string, unknown> = {}) => {
++    const config = NodePluginSchema.parse({
++        abuseBlocker: { enabled: true, ...overrides },
++    }).abuseBlocker!;
++    const state = new AbuseBlockerState();
++    state.configure({
++        config,
++        configFingerprint: 'test-config',
++        ignoredUsers: [],
++        ignoredSources: [],
++        ignoredDestinations: [],
++    });
++    return state;
++};
++
++interface IEvent {
++    timestamp: number;
++    port?: number;
++    ip?: string | null;
++    host?: string | null;
++    userId?: string;
++    sourceIp?: string;
++    inboundTag?: string | null;
++}
++
++const analyze = (state: AbuseBlockerState, event: IEvent) =>
++    state.analyze({
++        userId: event.userId ?? '42',
++        sourceIp: event.sourceIp ?? '198.51.100.10',
++        destinationIp: event.host ? null : (event.ip ?? '192.0.2.1'),
++        destinationHost: event.host ?? null,
++        destinationPort: event.port ?? 22,
++        inboundTag: event.inboundTag ?? 'VLESS',
++        timestamp: event.timestamp,
++        xrayReport: webhook,
++    });
++
++/** 198.18.<n>.1, one host in each of `count` distinct /24s (RFC 2544). */
++const network = (index: number) => `198.${18 + (index >> 8)}.${index & 255}.1`;
++
++const T0 = 1_000_000_000;
++
++describe('AbuseBlockerState v2 defaults', () => {
++    it('defaults to report mode and the v2 rule set; old configs still parse', () => {
++        const config = NodePluginSchema.parse({
++            abuseBlocker: {
++                enabled: true,
++                blockScore: 300,
++                horizontalScan: { uniqueDestinations: 30 },
++            },
++        }).abuseBlocker!;
++        assert.equal(config.mode, 'report');
++        assert.equal(config.ruleSet, 'v2');
++        assert.equal(config.confirmationSeconds, 60);
++        assert.ok(config.scanPorts.includes(22));
++        assert.ok(!config.scanPorts.includes(443));
++        assert.equal(config.horizontalScan.uniqueDestinations, 30);
++    });
++
++    it('does not run the PR #46 geometry rules by default', () => {
++        const state = createState();
++        for (let index = 1; index <= 60; index += 1) {
++            assert.equal(
++                analyze(state, { timestamp: T0 + index * 100, ip: `192.0.2.${index}` }),
++                null,
++            );
++        }
++    });
++});
++
++describe('horizontal_sweep', () => {
++    it('reports a candidate at 150 /24s and confirms at least 60 s later', () => {
++        const state = createState();
++        const results = [];
++        for (let index = 0; index < 260; index += 1) {
++            const result = analyze(state, { timestamp: T0 + index * 1000, ip: network(index) });
++            if (result) results.push({ index, result });
++        }
++
++        const [candidate, confirmed] = results;
++        assert.equal(candidate.index, 149);
++        assert.equal(candidate.result.detections[0].rule, 'horizontal_sweep');
++        assert.equal(candidate.result.detections[0].phase, 'candidate');
++        assert.equal(candidate.result.detections[0].count, 150);
++        assert.equal(candidate.result.detections[0].unit, 'networks');
++        assert.equal(candidate.result.severity, 'alert');
++        assert.equal(candidate.result.shouldBlock, false);
++
++        assert.equal(confirmed.index, 209);
++        assert.equal(confirmed.result.detections[0].phase, 'confirmed');
++        assert.equal(confirmed.result.severity, 'blocked');
++        assert.equal(confirmed.result.shouldBlock, true);
++        assert.equal(confirmed.result.sourceIpUserCount, 1);
++    });
++
++    it('fires again every cooldown while the sweep continues (no latch)', () => {
++        const state = createState();
++        const phases = [];
++        for (let index = 0; index < 900; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 1000,
++                ip: network(index % 500),
++            });
++            const detection = result?.detections.find((item) => item.rule === 'horizontal_sweep');
++            if (detection) phases.push([index, detection.phase]);
++        }
++        assert.deepEqual(phases, [
++            [149, 'candidate'],
++            [209, 'confirmed'],
++            [509, 'confirmed'],
++            [809, 'confirmed'],
++        ]);
++    });
++
++    it('ignores ports outside scanPorts, such as an app port', () => {
++        const state = createState({ sessionRateBurst: { enabled: false } });
++        for (let index = 0; index < 400; index += 1) {
++            assert.equal(
++                analyze(state, { timestamp: T0 + index * 500, ip: network(index), port: 50300 }),
++                null,
++            );
++        }
++    });
++
++    it('keeps at most maxNetworksPerKey networks per key', () => {
++        const state = createState({
++            horizontalSweep: { uniqueNetworks: 20, maxNetworksPerKey: 20 },
++        });
++        let last = null;
++        for (let index = 0; index < 400; index += 1) {
++            last = analyze(state, { timestamp: T0 + index * 1000, ip: network(index) }) ?? last;
++        }
++        assert.ok(last);
++        assert.ok(last.detections.every((detection) => detection.count <= 20));
++    });
++});
++
++describe('hammer_target', () => {
++    it('counts sessions to one IP and confirms a continuing hammer', () => {
++        const state = createState();
++        const results = [];
++        for (let index = 0; index < 400; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 2000,
++                ip: '192.0.2.89',
++                port: 3389,
++            });
++            if (result) results.push({ index, detection: result.detections[0], result });
++        }
++        assert.equal(results[0].index, 299);
++        assert.equal(results[0].detection.rule, 'hammer_target');
++        assert.equal(results[0].detection.phase, 'candidate');
++        assert.equal(results[0].detection.key, '3389|192.0.2.89');
++        assert.equal(results[1].index, 329);
++        assert.equal(results[1].detection.phase, 'confirmed');
++        assert.equal(results[1].result.shouldBlock, true);
++    });
++
++    it('counts sessions to one hostname without resolving it', () => {
++        const state = createState();
++        let last = null;
++        for (let index = 0; index < 360; index += 1) {
++            last =
++                analyze(state, {
++                    timestamp: T0 + index * 2000,
++                    host: 'rdp.office.example',
++                    port: 3389,
++                }) ?? last;
++        }
++        assert.equal(last?.detections[0].rule, 'hammer_target');
++        assert.equal(last?.detections[0].key, '3389|rdp.office.example');
++        assert.equal(last?.shouldBlock, true);
++    });
++
++    it('caps tracked targets per user', () => {
++        const state = createState({ hammerTarget: { maxTargetsPerUser: 2, sessions: 3 } });
++        const hits = [];
++        for (let index = 0; index < 30; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 1000,
++                ip: `192.0.2.${(index % 3) + 1}`,
++                port: 3389,
++            });
++            if (result) hits.push(index);
++        }
++        assert.deepEqual(hits, []);
++    });
++});
++
++describe('session_rate_burst', () => {
++    it('reports 600 non-web sessions per minute but never blocks by default', () => {
++        const state = createState();
++        const results = [];
++        for (let index = 0; index < 2400; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 50,
++                ip: `192.0.2.${(index % 5) + 1}`,
++                port: 50300,
++            });
++            if (result) results.push(result);
++        }
++        assert.deepEqual(
++            results.map((result) => [
++                result.detections[0].rule,
++                result.detections[0].phase,
++                result.severity,
++            ]),
++            [
++                ['session_rate_burst', 'candidate', 'alert'],
++                ['session_rate_burst', 'confirmed', 'alert'],
++            ],
++        );
++        assert.ok(results.every((result) => !result.shouldBlock));
++    });
++
++    it('does not count 80/443', () => {
++        const state = createState();
++        for (let index = 0; index < 2000; index += 1) {
++            assert.equal(
++                analyze(state, { timestamp: T0 + index * 10, ip: '192.0.2.1', port: 443 }),
++                null,
++            );
++        }
++    });
++});
++
++describe('domain rules', () => {
++    it('horizontal_sweep_domains fires at 50 registrable domains on a scan port', () => {
++        const state = createState();
++        let first = null;
++        for (let index = 0; index < 120; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 1000,
++                host: `ssh.site${index}.example`,
++            });
++            first ??= result && { index, result };
++        }
++        assert.equal(first?.index, 49);
++        assert.equal(first?.result.detections[0].rule, 'horizontal_sweep_domains');
++        assert.equal(first?.result.detections[0].unit, 'domains');
++    });
++
++    it('subdomain_sweep reports 100 hostnames under one domain and never blocks', () => {
++        const state = createState({ hammerTarget: { enabled: false } });
++        const results = [];
++        for (let index = 0; index < 300; index += 1) {
++            const result = analyze(state, {
++                timestamp: T0 + index * 1000,
++                host: `host${index}.corp.example`,
++                port: index % 2 ? 22 : 3389,
++            });
++            if (result) results.push(result);
++        }
++        assert.equal(results[0].detections[0].rule, 'subdomain_sweep');
++        assert.equal(results[0].detections[0].key, 'corp.example');
++        assert.equal(results[0].detections[0].count, 100);
++        assert.ok(results.every((result) => !result.shouldBlock));
++    });
++
++    it('five jump hosts under one domain stay silent', () => {
++        const state = createState();
++        for (let index = 0; index < 600; index += 1) {
++            assert.equal(
++                analyze(state, {
++                    timestamp: T0 + index * 3000,
++                    host: `jump${index % 5}.corp.example`,
++                }),
++                null,
++            );
++        }
++    });
++
++    it('never scores hostnames on 80/443', () => {
++        const state = createState({ scanPorts: [22, 443] });
++        for (let index = 0; index < 400; index += 1) {
++            assert.equal(
++                analyze(state, {
++                    timestamp: T0 + index * 1000,
++                    host: `h${index}.site${index}.example`,
++                    port: 443,
++                }),
++                null,
++            );
++        }
++    });
++});
++
++describe('source guards', () => {
++    const sweep = (state: AbuseBlockerState, event: Partial<IEvent> = {}) => {
++        let last = null;
++        for (let index = 0; index < 220; index += 1) {
++            last =
++                analyze(state, { timestamp: T0 + index * 1000, ip: network(index), ...event }) ??
++                last;
++        }
++        return last!;
++    };
++
++    it('never blocks non-public sources', () => {
++        const result = sweep(createState(), { sourceIp: '10.255.0.2' });
++        assert.equal(result.severity, 'blocked');
++        assert.equal(result.shouldBlock, false);
++        assert.equal(result.skipReason, 'non_public_source');
++    });
++
++    it('reports shared_source when another user used the source in the last hour', () => {
++        const state = createState();
++        analyze(state, { timestamp: T0 - 1000, userId: '43', ip: '192.0.2.200', port: 443 });
++        const result = sweep(state);
++        assert.equal(result.skipReason, 'shared_source');
++        assert.equal(result.sourceIpUserCount, 2);
++    });
++
++    it('honours reportOnlyUserIds and reportOnlyInboundTags', () => {
++        assert.equal(
++            sweep(createState({ sourceGuards: { reportOnlyUserIds: [42] } })).skipReason,
++            'report_only_user',
++        );
++        assert.equal(
++            sweep(createState({ sourceGuards: { reportOnlyInboundTags: ['MESH'] } }), {
++                inboundTag: 'MESH',
++            }).skipReason,
++            'report_only_inbound',
++        );
++    });
++
++    it('bounds the source tracker', () => {
++        const state = createState({ sourceGuards: { maxTrackedSources: 100 } });
++        for (let index = 0; index < 1000; index += 1) {
++            analyze(state, {
++                timestamp: T0 + index,
++                sourceIp: `203.0.113.${index % 250}`,
++                userId: String(index),
++                port: 443,
++            });
++        }
++        assert.equal(state.stats.trackedSources, 100);
++    });
++});
++
++describe('observation mapping for hostnames', () => {
++    const domainHook = {
++        ...webhook,
++        destination: 'SSH.Example.:22',
++        originalTarget: 'tcp:SSH.Example.:22',
++    };
++
++    it('keeps the PR #46 behaviour without options', () => {
++        assert.equal(toAbuseBlockerObservation(domainHook), null);
++    });
++
++    it('maps a hostname request to a normalized hostname observation', () => {
++        const observation = toAbuseBlockerObservation(domainHook, { domains: true });
++        assert.equal(observation?.destinationIp, null);
++        assert.equal(observation?.destinationHost, 'ssh.example');
++        assert.equal(observation?.destinationPort, 22);
++        assert.equal(observation?.inboundTag, 'VLESS');
++    });
++
++    it('still prefers an IP from any target field', () => {
++        const observation = toAbuseBlockerObservation(
++            { ...domainHook, originalTarget: 'tcp:192.0.2.7:22' },
++            { domains: true },
++        );
++        assert.equal(observation?.destinationIp, '192.0.2.7');
++        assert.equal(observation?.destinationHost, null);
++    });
++
++    it('normalizes IDNA and rejects garbage', () => {
++        assert.equal(normalizeHostname('Пример.Example.'), 'xn--e1afmkfd.example');
++        for (const bad of [
++            '',
++            'localhost',
++            '192.0.2.1',
++            '[2001:db8::1]',
++            'a..b.test',
++            '-bad.test',
++            'x'.repeat(64) + '.test',
++        ]) {
++            assert.equal(normalizeHostname(bad), null, bad);
++        }
++        assert.equal(getRegistrableDomain('a.b.corp.example'), 'corp.example');
++    });
++});
+diff --git a/tests/abuse-blocker/abuse-blocker.state.test.ts b/tests/abuse-blocker/abuse-blocker.state.test.ts
+index 23d18a5..0e5dcdd 100644
+--- a/tests/abuse-blocker/abuse-blocker.state.test.ts
++++ b/tests/abuse-blocker/abuse-blocker.state.test.ts
+@@ -23,9 +23,19 @@ const webhook: XrayWebhookModel = {
+     ts: 0,
+ };
+ 
++// The defaults now run the v2 rule set in report-only mode. These tests pin the
++// PR #46 detectors, so they opt into the settings that reproduce them.
++const LEGACY = {
++    ruleSet: 'legacy',
++    scanPorts: [],
++    confirmationSeconds: 0,
++    rearmAfterCooldown: false,
++    sourceGuards: { enabled: false },
++};
++
+ const createState = (overrides: Record<string, unknown> = {}) => {
+     const config = NodePluginSchema.parse({
+-        abuseBlocker: { enabled: true, ...overrides },
++        abuseBlocker: { enabled: true, ...LEGACY, ...overrides },
+     }).abuseBlocker!;
+     const state = new AbuseBlockerState();
+     state.configure({
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -67,6 +67,7 @@
+     "rxjs": "7.8.2",
+     "semver": "^7.8.5",
+     "sockdestroy": "1.4.0",
++    "tldts": "7.4.15",
+     "winston": "^3.19.0",
+     "zod": "4.4.3"
+   },
