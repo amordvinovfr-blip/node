@@ -131,7 +131,31 @@ const loadPr = (variant = 'patched') => {
     const src = (relative) => require(path.join(REPO_ROOT, relative));
     const variantSrc = (relative) => require(path.join(root, relative));
 
+    // The handler formats a debug timing string on every webhook even with debug
+    // logging off; the harness silences logs, so it skips the formatting too.
+    src('src/common/utils/get-elapsed-time.ts').formatExecutionTime = () => '';
+
     const handlerModule = variantSrc('src/modules/_plugin/events/xray-webhook/xray-webhook.handler.ts');
+    const mapObservation = handlerModule.toAbuseBlockerObservation;
+    // The harness maps each event once with the PR's own function (to label it)
+    // and hands that result to the handler's own call for the same event.
+    let handoff = null;
+    const sameEvent = (a, b) =>
+        a.ts === b.ts &&
+        a.email === b.email &&
+        a.network === b.network &&
+        a.source === b.source &&
+        a.destination === b.destination &&
+        a.originalTarget === b.originalTarget &&
+        a.routeTarget === b.routeTarget;
+    handlerModule.toAbuseBlockerObservation = (webhook, options) => {
+        if (handoff && sameEvent(handoff.webhook, webhook)) {
+            const { observation } = handoff;
+            handoff = null;
+            return observation && { ...observation, xrayReport: webhook };
+        }
+        return mapObservation(webhook, options);
+    };
     const { AbuseBlockerState } = variantSrc('src/modules/_plugin/services/states/abuse-blocker.state.ts');
     const { XrayWebhookEvent } = src('src/modules/_plugin/events/xray-webhook/xray-webhook.event.ts');
     const { PluginStateService } = src('src/modules/_plugin/services/plugin-state.service.ts');
@@ -143,7 +167,13 @@ const loadPr = (variant = 'patched') => {
         REPO_ROOT,
         Logger,
         XrayWebhookHandler: handlerModule.XrayWebhookHandler,
-        toAbuseBlockerObservation: handlerModule.toAbuseBlockerObservation,
+        toAbuseBlockerObservation: mapObservation,
+        /** Maps `webhook` and keeps the result for the handler's next call. */
+        mapForHandler: (webhook, options) => {
+            const observation = mapObservation(webhook, options);
+            handoff = { webhook, observation };
+            return observation;
+        },
         XrayWebhookEvent,
         AbuseBlockerState,
         IpMatcher,

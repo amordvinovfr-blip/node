@@ -172,7 +172,9 @@ describe('PR #46 on true positives (CONTEXT.md §1)', () => {
 });
 
 describe('scenario registry', () => {
-    it('every registered scenario is covered by a test above', () => {
+    // compare.test.js pins every registered scenario for both variants; this
+    // file keeps the detailed PR head assertions for the original sixteen.
+    it('the scenarios detailed above are registered', () => {
         const covered = [
             'bittorrent-dht',
             'bittorrent-tcp',
@@ -191,6 +193,7 @@ describe('scenario registry', () => {
             'tp-rdp-hammer',
             'tp-session-burst',
         ];
-        assert.deepEqual(SCENARIOS.map((scenario) => scenario.id).sort(), covered.sort());
+        const registered = new Set(SCENARIOS.map((scenario) => scenario.id));
+        assert.deepEqual(covered.filter((id) => !registered.has(id)), []);
     });
 });

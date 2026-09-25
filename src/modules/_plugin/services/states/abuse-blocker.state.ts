@@ -30,6 +30,7 @@ const NON_PUBLIC_SOURCES = [
     'fe80::/10',
 ];
 const MAX_USERS_PER_SOURCE_TRACKED = 16;
+const SOURCE_LRU_REFRESH_MS = 60_000;
 const HAMMER_BUCKETS = 15;
 const BURST_BUCKETS = 12;
 const WEB_PORTS = new Set([80, 443]);
@@ -192,7 +193,7 @@ export class AbuseBlockerState {
     private reportOnlyUsers = new Set<string>();
     private reportOnlyInbounds = new Set<string>();
     private readonly nonPublicSources = new IpMatcher(NON_PUBLIC_SOURCES);
-    private sources = new Map<string, Map<string, number>>();
+    private sources = new Map<string, { users: Map<string, number>; touchedAt: number }>();
     private users = new Map<string, IUserState>();
     private reports = new Map<string, AbuseBlockerReportModel>();
     private coverageMode: AbuseBlockerCoverageMode = 'partial';
@@ -787,18 +788,33 @@ export class AbuseBlockerState {
         return 'confirmed';
     }
 
-    /** Remembers which users used a source address (bounded LRU of sources and users). */
+    /**
+     * Remembers which users used a source address: an LRU of sources (position
+     * refreshed at most once a minute) with at most 16 users each.
+     */
     private trackSourceUser(observation: IAbuseBlockerObservation): void {
-        const limit = this.config!.sourceGuards.maxTrackedSources;
-        const users = getOrCreate(this.sources, observation.sourceIp, limit, () => new Map());
-        users.delete(observation.userId);
-        users.set(observation.userId, observation.timestamp);
-        if (users.size > MAX_USERS_PER_SOURCE_TRACKED) users.delete(users.keys().next().value!);
+        const { sourceIp, userId, timestamp } = observation;
+        let source = this.sources.get(sourceIp);
+        if (!source) {
+            if (this.sources.size >= this.config!.sourceGuards.maxTrackedSources) {
+                this.sources.delete(this.sources.keys().next().value!);
+            }
+            source = { users: new Map(), touchedAt: timestamp };
+            this.sources.set(sourceIp, source);
+        } else if (timestamp - source.touchedAt >= SOURCE_LRU_REFRESH_MS) {
+            this.sources.delete(sourceIp);
+            this.sources.set(sourceIp, source);
+            source.touchedAt = timestamp;
+        }
+        if (!source.users.has(userId) && source.users.size >= MAX_USERS_PER_SOURCE_TRACKED) {
+            source.users.delete(source.users.keys().next().value!);
+        }
+        source.users.set(userId, timestamp);
     }
 
     /** Distinct users on the source in the guard window; saturates at 16. */
     private countSourceUsers(sourceIp: string, timestamp: number): number {
-        const users = this.sources.get(sourceIp);
+        const users = this.sources.get(sourceIp)?.users;
         if (!users) return 0;
         const cutoff = timestamp - this.config!.sourceGuards.userWindowSeconds * 1000;
         let count = 0;

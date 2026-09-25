@@ -104,26 +104,30 @@ class SourceUsers {
         this.evicted = 0;
     }
 
+    /** LRU position is refreshed at most once a minute per source, to keep this cheap. */
     observe(sourceIp, userId, timestampMs) {
-        let users = this.sources.get(sourceIp);
-        if (users) {
-            this.sources.delete(sourceIp);
-        } else {
+        let source = this.sources.get(sourceIp);
+        if (!source) {
             if (this.sources.size >= this.maxSources) {
                 this.sources.delete(this.sources.keys().next().value);
                 this.evicted += 1;
             }
-            users = new Map();
+            source = { users: new Map(), touchedAt: timestampMs };
+            this.sources.set(sourceIp, source);
+        } else if (timestampMs - source.touchedAt >= 60_000) {
+            this.sources.delete(sourceIp);
+            this.sources.set(sourceIp, source);
+            source.touchedAt = timestampMs;
         }
-        this.sources.set(sourceIp, users);
-        users.delete(userId);
-        users.set(userId, timestampMs);
-        if (users.size > USERS_PER_SOURCE_TRACKED) users.delete(users.keys().next().value);
+        if (!source.users.has(userId) && source.users.size >= USERS_PER_SOURCE_TRACKED) {
+            source.users.delete(source.users.keys().next().value);
+        }
+        source.users.set(userId, timestampMs);
     }
 
     /** Distinct users seen on the IP since `sinceMs` (saturates at 64). */
     count(sourceIp, sinceMs) {
-        const users = this.sources.get(sourceIp);
+        const users = this.sources.get(sourceIp)?.users;
         if (!users) return 0;
         let count = 0;
         for (const lastSeen of users.values()) if (lastSeen >= sinceMs) count += 1;

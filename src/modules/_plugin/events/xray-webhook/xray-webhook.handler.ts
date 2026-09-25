@@ -33,11 +33,16 @@ export const toAbuseBlockerObservation = (
     if (!webhook.email || !/^\d+$/.test(webhook.email)) return null;
 
     const source = parseNetworkEndpoint(webhook.source);
-    const targets = [webhook.originalTarget, webhook.routeTarget, webhook.destination];
-    const destination = targets
-        .map(parseNetworkEndpoint)
-        .find((candidate) => candidate?.port && candidate.port >= 1 && candidate.port <= 65535);
     if (!source) return null;
+    const targets = [webhook.originalTarget, webhook.routeTarget, webhook.destination];
+    let destination: ReturnType<typeof parseNetworkEndpoint> = null;
+    for (const target of targets) {
+        const candidate = parseNetworkEndpoint(target);
+        if (candidate?.port && candidate.port >= 1 && candidate.port <= 65535) {
+            destination = candidate;
+            break;
+        }
+    }
 
     const observation = {
         userId: webhook.email,
@@ -56,7 +61,11 @@ export const toAbuseBlockerObservation = (
     }
     if (!options.domains) return null;
 
-    const domain = targets.map(parseDomainEndpoint).find(Boolean);
+    let domain: ReturnType<typeof parseDomainEndpoint> = null;
+    for (const target of targets) {
+        domain = parseDomainEndpoint(target);
+        if (domain) break;
+    }
     if (!domain) return null;
     return {
         ...observation,

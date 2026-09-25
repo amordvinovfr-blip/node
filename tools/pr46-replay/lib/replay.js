@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const { isIP } = require('node:net');
 const readline = require('node:readline');
 const zlib = require('node:zlib');
 
@@ -11,6 +12,21 @@ const { InputStats, VariantStats } = require('./stats');
 const { classifyPort } = require('./traffic-class');
 
 const WEB_PORTS = new Set([80, 443]);
+
+/** IP of an Xray `ip:port` / `[ip]:port` endpoint, as parseNetworkEndpoint returns it, or null. */
+const endpointIp = (value) => {
+    let host;
+    if (value.startsWith('[')) {
+        const end = value.indexOf(']');
+        if (end < 0) return null;
+        host = value.slice(1, end);
+    } else {
+        const separator = value.lastIndexOf(':');
+        host = separator < 0 ? value : value.slice(0, separator);
+        if (host.includes(':')) host = value;
+    }
+    return isIP(host.split('%')[0]) === 0 ? null : host;
+};
 
 /**
  * Stands in for NftService. The PR's XrayWebhookHandler calls
@@ -110,8 +126,8 @@ class VariantEngine {
     }
 
     observationOf(webhook) {
-        if (this.variant === 'head') return this.pr.toAbuseBlockerObservation(webhook);
-        return this.pr.toAbuseBlockerObservation(webhook, { domains: this.state.acceptsDomains });
+        if (this.variant === 'head') return this.pr.mapForHandler(webhook);
+        return this.pr.mapForHandler(webhook, { domains: this.state.acceptsDomains });
     }
 
     label(record, observation) {
@@ -158,6 +174,8 @@ class VariantEngine {
         const callsBefore = this.recorder.calls;
         await this.handler.handle(new this.pr.XrayWebhookEvent(webhook, 'abuse'));
 
+        // `reports` is the state's buffer; skip the flush (an array copy) when empty.
+        if (this.state.reports.size === 0) return;
         for (const report of this.state.flushReports()) {
             const blocked = report.actionReport.action === 'ip_block';
             const rules = report.detections.map((detection) => detection.rule);
@@ -241,8 +259,7 @@ class Replay {
                 engine.pr.Logger.overrideLogger(silentLogger(this.counters));
                 return engine;
             });
-            this.parseEndpoint = this.engines[0].pr.parseNetworkEndpoint;
-        } catch (error) {
+            } catch (error) {
             this.close();
             throw error;
         }
@@ -261,8 +278,8 @@ class Replay {
         if (record.timestampMs < this.lastTimestampMs) this.input.lines.lateReordered += 1;
         this.lastTimestampMs = Math.max(this.lastTimestampMs, record.timestampMs);
 
-        const sourceIp = this.parseEndpoint(record.source)?.ip ?? null;
-        const destinationIsIp = this.parseEndpoint(record.destination) !== null;
+        const sourceIp = endpointIp(record.source);
+        const destinationIsIp = endpointIp(record.destination) !== null;
         this.input.observeRecord(record, sourceIp, destinationIsIp);
         if (record.status !== 'accepted') return;
 

@@ -69,6 +69,10 @@ export const parseIpAddress = (input: string): IParsedIpAddress | null => {
     return null;
 };
 
+/** Same answer as `parseIpAddress(input) !== null`, without building the BigInt. */
+export const isIpAddress = (input: string): boolean =>
+    isIP(input.replace(/^\[|\]$/g, '').split('%')[0]) !== 0;
+
 export const getNetworkKey = (
     ip: string,
     ipv4Prefix: number,
@@ -108,6 +112,7 @@ export class IpMatcher {
     }
 
     matches(ip: string): boolean {
+        if (this.ranges.length === 0) return false;
         const parsed = parseIpAddress(ip);
         if (!parsed) return false;
 
@@ -133,19 +138,19 @@ export const parseNetworkEndpoint = (input: string | null): IParsedNetworkEndpoi
         const closingBracket = value.indexOf(']');
         if (closingBracket < 0) return null;
         const ip = value.slice(1, closingBracket);
-        if (!parseIpAddress(ip)) return null;
+        if (!isIpAddress(ip)) return null;
         const rawPort = value.slice(closingBracket + 1).replace(/^:/, '');
         const port = rawPort ? Number(rawPort) : null;
         return { ip, port: Number.isInteger(port) ? port : null };
     }
 
-    if (parseIpAddress(value)) return { ip: value, port: null };
+    if (isIpAddress(value)) return { ip: value, port: null };
 
     const separator = value.lastIndexOf(':');
     if (separator < 0) return null;
     const ip = value.slice(0, separator);
     const port = Number(value.slice(separator + 1));
-    if (!parseIpAddress(ip) || !Number.isInteger(port)) return null;
+    if (!isIpAddress(ip) || !Number.isInteger(port)) return null;
 
     return { ip, port };
 };

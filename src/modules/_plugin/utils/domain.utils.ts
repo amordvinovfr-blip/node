@@ -4,6 +4,7 @@ import { domainToASCII } from 'node:url';
 import { getDomain } from 'tldts';
 
 const LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/;
+const PLAIN_ASCII = /^[a-z0-9._-]+$/;
 
 /**
  * Lowercase ASCII (punycode) hostname, or null for IP literals and garbage.
@@ -12,7 +13,9 @@ export const normalizeHostname = (input: string): string | null => {
     const trimmed = input.trim().replace(/\.$/, '');
     if (!trimmed || trimmed.length > 253 || isIP(trimmed.replace(/^\[|\]$/g, ''))) return null;
 
-    const ascii = domainToASCII(trimmed);
+    // Lowercase LDH names without punycode are already in ASCII form.
+    const ascii =
+        PLAIN_ASCII.test(trimmed) && !trimmed.includes('xn--') ? trimmed : domainToASCII(trimmed);
     if (!ascii || ascii.length > 253) return null;
 
     const labels = ascii.split('.');
