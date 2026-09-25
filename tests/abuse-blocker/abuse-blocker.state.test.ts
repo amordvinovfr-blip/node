@@ -23,9 +23,19 @@ const webhook: XrayWebhookModel = {
     ts: 0,
 };
 
+// The defaults now run the v2 rule set in report-only mode. These tests pin the
+// PR #46 detectors, so they opt into the settings that reproduce them.
+const LEGACY = {
+    ruleSet: 'legacy',
+    scanPorts: [],
+    confirmationSeconds: 0,
+    rearmAfterCooldown: false,
+    sourceGuards: { enabled: false },
+};
+
 const createState = (overrides: Record<string, unknown> = {}) => {
     const config = NodePluginSchema.parse({
-        abuseBlocker: { enabled: true, ...overrides },
+        abuseBlocker: { enabled: true, ...LEGACY, ...overrides },
     }).abuseBlocker!;
     const state = new AbuseBlockerState();
     state.configure({
