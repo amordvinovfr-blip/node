@@ -19,3 +19,14 @@ This package is the smallest thing that makes the PR build:
 
 `package.json` points `@remnawave/node-plugins` at this folder with a `file:`
 specifier. Revert that line once a real release with `abuseBlocker` exists.
+
+## On branch `review/pr46-detection`
+
+The schema here also carries the proposed detector settings: `mode`,
+`ruleSet`, `scanPorts` (with `ABUSE_BLOCKER_RECON_PORTS`),
+`confirmationSeconds`, `rearmAfterCooldown`, `horizontalSweep`,
+`hammerTarget`, `sessionRateBurst`, `domains` and `sourceGuards`. Every new
+field has a default, so an old `abuseBlocker` config still parses.
+`docs/pr46-review/detection-node-plugins.patch` is that change as a diff
+against the author's `libs/node-plugins/models/node-plugins.schema.ts`.
+Rebuild `build/backend/` with `npx tsc -p tools/pr46-replay/stubs/node-plugins/tsconfig.json`.
